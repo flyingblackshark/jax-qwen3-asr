@@ -4,6 +4,7 @@ import asyncio
 import base64
 import copy
 import dataclasses
+import hashlib
 import json
 import logging
 import math
@@ -352,9 +353,16 @@ class TokenizerManager:
         audio_token_start = None
         audio_token_len = None
         if isinstance(obj, GenerateReqInput) and obj.audio_data is not None:
-            input_ids, audio_features, audio_attention_mask, audio_token_start, audio_token_len = (
-                self._process_audio_inputs(obj.audio_data, input_ids)
-            )
+            (
+                input_ids,
+                audio_features,
+                audio_attention_mask,
+                audio_token_start,
+                audio_token_len,
+                audio_hash,
+            ) = self._process_audio_inputs(obj.audio_data, input_ids)
+            # Prevent prefix-cache collisions across different audio inputs.
+            obj.extra_key = self._merge_asr_audio_extra_key(obj.extra_key, audio_hash)
 
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(
@@ -406,7 +414,27 @@ class TokenizerManager:
         output_lengths = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_len // 100) * 13
         return int(output_lengths)
 
-    def _decode_audio_base64(self, audio_data: str) -> np.ndarray:
+    def _merge_asr_audio_extra_key(
+        self, extra_key: str | list[str] | None, audio_hash: str
+    ) -> str:
+        """Append an audio fingerprint to extra_key so radix/SWA caches don't mix different audio."""
+        audio_key = f"asr-audio:{audio_hash[:16]}"
+        if extra_key is None:
+            return audio_key
+        if isinstance(extra_key, list):
+            if len(extra_key) == 0:
+                extra_key = ""
+            elif len(extra_key) == 1:
+                extra_key = extra_key[0]
+            else:
+                extra_key = "|".join(str(x) for x in extra_key)
+        if extra_key == "":
+            return audio_key
+        if audio_key in extra_key:
+            return extra_key
+        return f"{extra_key}|{audio_key}"
+
+    def _decode_audio_base64(self, audio_data: str) -> tuple[np.ndarray, str]:
         if self.audio_sampling_rate is None:
             raise ValueError("Audio feature extractor is not initialized.")
         if audio_data.startswith("data:"):
@@ -418,6 +446,8 @@ class TokenizerManager:
             b64 = audio_data
 
         raw = base64.b64decode(b64)
+        # Used to isolate prefix KV cache across different audio inputs.
+        audio_hash = hashlib.sha1(raw).hexdigest()
         audio, sr = sf.read(BytesIO(raw), dtype="float32")
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
@@ -435,12 +465,14 @@ class TokenizerManager:
                     audio = _linear_resample(audio, int(sr), int(self.audio_sampling_rate))
             else:
                 audio = _linear_resample(audio, int(sr), int(self.audio_sampling_rate))
-        return np.asarray(audio, dtype=np.float32)
+        return np.asarray(audio, dtype=np.float32), audio_hash
 
-    def _extract_audio_features(self, audio_data: str) -> tuple[np.ndarray, np.ndarray, int]:
+    def _extract_audio_features(
+        self, audio_data: str
+    ) -> tuple[np.ndarray, np.ndarray, int, str]:
         if self.feature_extractor is None:
             raise ValueError("Audio feature extractor is not initialized.")
-        audio = self._decode_audio_base64(audio_data)
+        audio, audio_hash = self._decode_audio_base64(audio_data)
         inputs = self.feature_extractor(
             audio,
             sampling_rate=self.audio_sampling_rate,
@@ -452,7 +484,7 @@ class TokenizerManager:
         audio_token_len = self._feat_extract_output_length(int(attention_mask.sum()))
         if audio_token_len <= 0:
             raise ValueError("Invalid audio token length derived from features.")
-        return input_features, attention_mask, audio_token_len
+        return input_features, attention_mask, audio_token_len, audio_hash
 
     def _expand_audio_tokens(
         self, input_ids: list[int], audio_token_len: int
@@ -494,7 +526,7 @@ class TokenizerManager:
 
     def _process_audio_inputs(
         self, audio_data: list[str] | str, input_ids: list[int]
-    ) -> tuple[list[int], np.ndarray, np.ndarray, int, int]:
+    ) -> tuple[list[int], np.ndarray, np.ndarray, int, int, str]:
         if input_ids is None:
             raise ValueError("Audio inputs require input_ids to be present.")
         if isinstance(audio_data, list):
@@ -502,11 +534,18 @@ class TokenizerManager:
                 raise ValueError("Only one audio input is supported per request.")
             audio_data = audio_data[0]
 
-        input_features, attention_mask, audio_token_len = self._extract_audio_features(
+        input_features, attention_mask, audio_token_len, audio_hash = self._extract_audio_features(
             audio_data
         )
         input_ids, audio_token_start = self._expand_audio_tokens(input_ids, audio_token_len)
-        return input_ids, input_features, attention_mask, audio_token_start, audio_token_len
+        return (
+            input_ids,
+            input_features,
+            attention_mask,
+            audio_token_start,
+            audio_token_len,
+            audio_hash,
+        )
 
     def _create_tokenized_object(
         self,
