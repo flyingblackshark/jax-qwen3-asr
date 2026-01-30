@@ -1,6 +1,7 @@
 """TokenizerManager is a process that tokenizes the text."""
 
 import asyncio
+import base64
 import copy
 import dataclasses
 import json
@@ -13,6 +14,7 @@ import sys
 import threading
 import time
 import uuid
+from io import BytesIO
 from collections import deque
 from datetime import datetime
 from http import HTTPStatus
@@ -21,10 +23,12 @@ from typing import Any
 import fastapi
 import jax
 import jax.numpy as jnp
+import numpy as np
 import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
+from transformers import WhisperFeatureExtractor
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
@@ -72,6 +76,25 @@ from sgl_jax.utils import TypeBasedDispatcher, get_exception_traceback
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 logger = logging.getLogger(__name__)
+
+try:
+    import librosa
+    import soundfile as sf
+except Exception:  # pragma: no cover - optional deps
+    librosa = None
+    sf = None
+
+
+def _linear_resample(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    if orig_sr == target_sr:
+        return audio
+    if audio.size == 0:
+        return audio.astype(np.float32)
+    ratio = float(target_sr) / float(orig_sr)
+    new_len = max(int(round(audio.shape[0] * ratio)), 1)
+    x_old = np.linspace(0.0, 1.0, num=audio.shape[0], endpoint=False)
+    x_new = np.linspace(0.0, 1.0, num=new_len, endpoint=False)
+    return np.interp(x_new, x_old, audio).astype(np.float32)
 
 
 @dataclasses.dataclass
@@ -148,6 +171,7 @@ class TokenizerManager:
             self.is_generation = self.model_config.is_generation
             self.context_len = self.model_config.context_len
             self.image_token_id = self.model_config.image_token_id
+            self.audio_token_id = getattr(self.model_config, "audio_token_id", None)
         else:
             self.model_config = None
         self.is_pause = False
@@ -167,6 +191,27 @@ class TokenizerManager:
                 revision=server_args.revision,
                 sub_dir="tokenizer" if server_args.multimodal else "",
             )
+
+        self.feature_extractor = None
+        self.audio_sampling_rate = None
+        if self.audio_token_id is None and self.tokenizer is not None:
+            self.audio_token_id = getattr(self.tokenizer, "audio_token_id", None)
+
+        if (
+            self.audio_token_id is not None
+            and not server_args.skip_tokenizer_init
+            and self.model_path is not None
+        ):
+            if librosa is None or sf is None:
+                raise RuntimeError(
+                    "Audio dependencies missing. Install librosa and soundfile to use audio inputs."
+                )
+            self.feature_extractor = WhisperFeatureExtractor.from_pretrained(
+                self.model_path,
+                revision=server_args.revision,
+                trust_remote_code=server_args.trust_remote_code,
+            )
+            self.audio_sampling_rate = int(self.feature_extractor.sampling_rate)
 
         # Store states
         self.no_create_loop = False
@@ -302,8 +347,25 @@ class TokenizerManager:
                 )
             encoded = self.tokenizer(input_text)
             input_ids = encoded["input_ids"]
+        audio_features = None
+        audio_attention_mask = None
+        audio_token_start = None
+        audio_token_len = None
+        if isinstance(obj, GenerateReqInput) and obj.audio_data is not None:
+            input_ids, audio_features, audio_attention_mask, audio_token_start, audio_token_len = (
+                self._process_audio_inputs(obj.audio_data, input_ids)
+            )
+
         self._validate_one_request(obj, input_ids)
-        return self._create_tokenized_object(obj, input_text, input_ids)
+        return self._create_tokenized_object(
+            obj,
+            input_text,
+            input_ids,
+            audio_features=audio_features,
+            audio_attention_mask=audio_attention_mask,
+            audio_token_start=audio_token_start,
+            audio_token_len=audio_token_len,
+        )
 
     def _validate_one_request(
         self, obj: GenerateReqInput | EmbeddingReqInput, input_ids: list[int]
@@ -337,11 +399,125 @@ class TokenizerManager:
                 f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
             )
 
+    def _feat_extract_output_length(self, input_len: int) -> int:
+        input_len = int(input_len)
+        input_lengths_leave = input_len % 100
+        feat_lengths = (input_lengths_leave - 1) // 2 + 1
+        output_lengths = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_len // 100) * 13
+        return int(output_lengths)
+
+    def _decode_audio_base64(self, audio_data: str) -> np.ndarray:
+        if self.audio_sampling_rate is None:
+            raise ValueError("Audio feature extractor is not initialized.")
+        if audio_data.startswith("data:"):
+            try:
+                _, b64 = audio_data.split(",", 1)
+            except ValueError:
+                raise ValueError("Invalid data URL for audio input.")
+        else:
+            b64 = audio_data
+
+        raw = base64.b64decode(b64)
+        audio, sr = sf.read(BytesIO(raw), dtype="float32")
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        if int(sr) != int(self.audio_sampling_rate):
+            if librosa is not None:
+                try:
+                    audio = librosa.resample(
+                        audio, orig_sr=sr, target_sr=self.audio_sampling_rate
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "librosa resample failed (%s); falling back to linear resample.",
+                        e,
+                    )
+                    audio = _linear_resample(audio, int(sr), int(self.audio_sampling_rate))
+            else:
+                audio = _linear_resample(audio, int(sr), int(self.audio_sampling_rate))
+        return np.asarray(audio, dtype=np.float32)
+
+    def _extract_audio_features(self, audio_data: str) -> tuple[np.ndarray, np.ndarray, int]:
+        if self.feature_extractor is None:
+            raise ValueError("Audio feature extractor is not initialized.")
+        audio = self._decode_audio_base64(audio_data)
+        inputs = self.feature_extractor(
+            audio,
+            sampling_rate=self.audio_sampling_rate,
+            padding=True,
+            return_attention_mask=True,
+        )
+        input_features = np.asarray(inputs["input_features"], dtype=np.float32)[0]
+        attention_mask = np.asarray(inputs["attention_mask"], dtype=np.int32)[0]
+        audio_token_len = self._feat_extract_output_length(int(attention_mask.sum()))
+        if audio_token_len <= 0:
+            raise ValueError("Invalid audio token length derived from features.")
+        return input_features, attention_mask, audio_token_len
+
+    def _expand_audio_tokens(
+        self, input_ids: list[int], audio_token_len: int
+    ) -> tuple[list[int], int]:
+        audio_token_id = self.audio_token_id
+        if audio_token_id is None and self.tokenizer is not None:
+            audio_token_id = getattr(self.tokenizer, "audio_token_id", None)
+            if audio_token_id is None:
+                audio_token = getattr(self.tokenizer, "audio_token", None)
+                if audio_token is not None:
+                    audio_token_id = self.tokenizer.convert_tokens_to_ids(audio_token)
+
+        if audio_token_id is None:
+            raise ValueError("Audio token id is not available for this tokenizer/model.")
+
+        positions = [i for i, tok in enumerate(input_ids) if tok == audio_token_id]
+        if not positions:
+            raise ValueError("Audio data provided but no audio token placeholder found in prompt.")
+
+        # If already expanded to correct length, keep as is.
+        if len(positions) == audio_token_len:
+            start = positions[0]
+            if positions != list(range(start, start + audio_token_len)):
+                raise ValueError("Audio tokens are not contiguous in the prompt.")
+            return input_ids, start
+
+        if len(positions) != 1:
+            raise ValueError(
+                f"Expected a single audio placeholder token, got {len(positions)} occurrences."
+            )
+
+        start = positions[0]
+        expanded = (
+            input_ids[:start]
+            + [audio_token_id] * audio_token_len
+            + input_ids[start + 1 :]
+        )
+        return expanded, start
+
+    def _process_audio_inputs(
+        self, audio_data: list[str] | str, input_ids: list[int]
+    ) -> tuple[list[int], np.ndarray, np.ndarray, int, int]:
+        if input_ids is None:
+            raise ValueError("Audio inputs require input_ids to be present.")
+        if isinstance(audio_data, list):
+            if len(audio_data) != 1:
+                raise ValueError("Only one audio input is supported per request.")
+            audio_data = audio_data[0]
+
+        input_features, attention_mask, audio_token_len = self._extract_audio_features(
+            audio_data
+        )
+        input_ids, audio_token_start = self._expand_audio_tokens(input_ids, audio_token_len)
+        return input_ids, input_features, attention_mask, audio_token_start, audio_token_len
+
     def _create_tokenized_object(
         self,
         obj: GenerateReqInput,
         input_text: str,
         input_ids: list[int],
+        *,
+        audio_features: np.ndarray | None = None,
+        audio_attention_mask: np.ndarray | None = None,
+        audio_token_start: int | None = None,
+        audio_token_len: int | None = None,
     ) -> TokenizedGenerateReqInput:
         """Create a tokenized request object from common parameters."""
         # Parse sampling parameters
@@ -371,6 +547,10 @@ class TokenizerManager:
             obj.lora_id,
             obj.extra_key,
             obj.return_routed_experts,
+            audio_features=audio_features,
+            audio_attention_mask=audio_attention_mask,
+            audio_token_start=audio_token_start,
+            audio_token_len=audio_token_len,
         )
         # note: When only `return_logprob` is specified, we assume that only the output probability is required.
         if (

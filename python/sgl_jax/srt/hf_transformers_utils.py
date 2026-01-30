@@ -1,7 +1,10 @@
 """Utilities for Huggingface Transformers."""
 
 import contextlib
+import json
 import os
+import shutil
+import tempfile
 import warnings
 from pathlib import Path
 
@@ -18,10 +21,13 @@ from transformers import (
 )
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
+from sgl_jax.srt.configs.qwen3_asr_config import Qwen3ASRConfig
 from sgl_jax.srt.managers.tiktoken_tokenizer import TiktokenTokenizer
 from sgl_jax.srt.utils.common_utils import is_remote_url, lru_cache_frozenset
 
-_CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {}
+_CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
+    "qwen3_asr": Qwen3ASRConfig,
+}
 
 for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):
@@ -167,6 +173,43 @@ def get_context_length(config):
 _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
 
 
+def _maybe_patch_qwen_tokenizer_dir(tokenizer_dir: str) -> str | None:
+    config_path = os.path.join(tokenizer_dir, "tokenizer_config.json")
+    if not os.path.exists(config_path):
+        return None
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+    except Exception:
+        return None
+
+    vocab_path = os.path.join(tokenizer_dir, "vocab.json")
+    merges_path = os.path.join(tokenizer_dir, "merges.txt")
+    if not (os.path.exists(vocab_path) and os.path.exists(merges_path)):
+        return None
+    if config.get("vocab_file") and config.get("merges_file"):
+        return None
+
+    tmp_dir = tempfile.mkdtemp(prefix="sglang_tokenizer_")
+    for filename in [
+        "vocab.json",
+        "merges.txt",
+        "tokenizer.json",
+        "added_tokens.json",
+        "special_tokens_map.json",
+    ]:
+        src_path = os.path.join(tokenizer_dir, filename)
+        if os.path.exists(src_path):
+            shutil.copy2(src_path, os.path.join(tmp_dir, filename))
+
+    config["vocab_file"] = "vocab.json"
+    config["merges_file"] = "merges.txt"
+    with open(os.path.join(tmp_dir, "tokenizer_config.json"), "w") as f:
+        json.dump(config, f)
+
+    return tmp_dir
+
+
 def get_tokenizer(
     tokenizer_name: str,
     *args,
@@ -198,7 +241,21 @@ def get_tokenizer(
             f"Remote URLs are not supported in JAX implementation. "
             f"Please use a local path or HuggingFace model name instead: {tokenizer_name}"
         )
-    tokenizer_name = download_from_hf(tokenizer_name)
+    tokenizer_name = download_from_hf(
+        tokenizer_name,
+        allow_patterns=[
+            "*.json",
+            "*.bin",
+            "*.model",
+            "*.py",
+            "*.tiktoken",
+            "merges.txt",
+            "vocab.json",
+            "vocab.txt",
+            "tokenizer.model",
+            "spiece.model",
+        ],
+    )
     if sub_dir:
         tokenizer_name += "/" + sub_dir
     try:
@@ -211,6 +268,23 @@ def get_tokenizer(
             **kwargs,
         )
     except TypeError as e:
+        patched_dir = _maybe_patch_qwen_tokenizer_dir(tokenizer_name)
+        if patched_dir is not None:
+            tokenizer = AutoTokenizer.from_pretrained(
+                patched_dir,
+                *args,
+                trust_remote_code=trust_remote_code,
+                tokenizer_revision=tokenizer_revision,
+                clean_up_tokenization_spaces=False,
+                **kwargs,
+            )
+            if not isinstance(tokenizer, PreTrainedTokenizerFast):
+                warnings.warn(
+                    "Using a slow tokenizer. This might cause a significant slowdown. Consider using a fast tokenizer instead.",
+                    stacklevel=2,
+                )
+            attach_additional_stop_token_ids(tokenizer)
+            return tokenizer
         # The LLaMA tokenizer causes a protobuf error in some environments.
         err_msg = (
             "Failed to load the tokenizer. If you are using a LLaMA V1 model "
@@ -240,6 +314,23 @@ def get_tokenizer(
             "Using a slow tokenizer. This might cause a significant slowdown. Consider using a fast tokenizer instead.",
             stacklevel=2,
         )
+
+    if getattr(tokenizer, "chat_template", None) is None:
+        candidate_paths = []
+        candidate_paths.append(os.path.join(tokenizer_name, "chat_template.json"))
+        candidate_paths.append(os.path.join(os.path.dirname(tokenizer_name), "chat_template.json"))
+        for template_path in candidate_paths:
+            if not os.path.exists(template_path):
+                continue
+            try:
+                with open(template_path) as f:
+                    data = json.load(f)
+                chat_template = data.get("chat_template")
+                if isinstance(chat_template, str) and chat_template.strip():
+                    tokenizer.chat_template = chat_template
+                    break
+            except Exception:
+                continue
 
     attach_additional_stop_token_ids(tokenizer)
     return tokenizer

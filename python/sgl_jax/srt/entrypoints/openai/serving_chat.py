@@ -84,6 +84,7 @@ class OpenAIServingChat(OpenAIServingBase):
             stream=request.stream,
             extra_key=request.extra_key,
             rid=request.rid,
+            audio_data=processed_messages.audio_data,
         )
 
         return adapted_request, request

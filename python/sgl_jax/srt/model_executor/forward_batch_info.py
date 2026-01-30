@@ -177,6 +177,11 @@ class ForwardBatch:
     # Encoder-Decoder specific fields
     attention_mask: jax.Array | None = None
     deterministic: bool = True
+    # Audio inputs (optional)
+    audio_features: jax.Array | None = None
+    audio_attention_mask: jax.Array | None = None
+    audio_token_start: jax.Array | None = None
+    audio_token_len: jax.Array | None = None
 
     def tree_flatten(self):
         children = (
@@ -195,6 +200,10 @@ class ForwardBatch:
             self.lora_ranks,
             self.spec_info,
             self.attention_mask,
+            self.audio_features,
+            self.audio_attention_mask,
+            self.audio_token_start,
+            self.audio_token_len,
         )
 
         aux_data = {
@@ -238,6 +247,17 @@ class ForwardBatch:
             obj.attention_mask = children[14]
         else:
             obj.attention_mask = None
+
+        if len(children) > 15:
+            obj.audio_features = children[15]
+            obj.audio_attention_mask = children[16]
+            obj.audio_token_start = children[17]
+            obj.audio_token_len = children[18]
+        else:
+            obj.audio_features = None
+            obj.audio_attention_mask = None
+            obj.audio_token_start = None
+            obj.audio_token_len = None
 
         return obj
 
@@ -324,6 +344,33 @@ class ForwardBatch:
                 batch.lora_ranks,
             )
 
+        if batch.audio_features is not None:
+            (
+                audio_features,
+                audio_attention_mask,
+                audio_token_start,
+                audio_token_len,
+            ) = device_array(
+                (
+                    batch.audio_features,
+                    batch.audio_attention_mask,
+                    batch.audio_token_start,
+                    batch.audio_token_len,
+                ),
+                sharding=(
+                    NamedSharding(model_runner.mesh, PartitionSpec())
+                    if jax.process_count() == 1
+                    else None
+                ),
+            )
+        else:
+            (
+                audio_features,
+                audio_attention_mask,
+                audio_token_start,
+                audio_token_len,
+            ) = (None, None, None, None)
+
         obj = cls(
             bid=batch.bid,
             forward_mode=batch.forward_mode,
@@ -345,6 +392,10 @@ class ForwardBatch:
             spec_info=batch.spec_info,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=batch.capture_hidden_mode,
+            audio_features=audio_features,
+            audio_attention_mask=audio_attention_mask,
+            audio_token_start=audio_token_start,
+            audio_token_len=audio_token_len,
         )
 
         # Auto-generate attention mask for Encoder-only models (e.g. UMT5Encoder, BERT)

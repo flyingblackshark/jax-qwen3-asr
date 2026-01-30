@@ -187,6 +187,18 @@ class ModelConfig:
         self.image_token_id = getattr(config, "image_token_id", None) or getattr(
             config, "image_token_index", None
         )
+        self.audio_token_id = getattr(config, "audio_token_id", None) or getattr(
+            config, "audio_token_index", None
+        )
+        if self.audio_token_id is None and hasattr(config, "thinker_config"):
+            thinker = getattr(config, "thinker_config", None)
+            if isinstance(thinker, dict):
+                self.audio_token_id = thinker.get("audio_token_id", None)
+            else:
+                self.audio_token_id = getattr(thinker, "audio_token_id", None)
+
+        if self.image_token_id is not None or self.audio_token_id is not None:
+            self.is_multimodal = True
 
     @staticmethod
     def from_server_args(

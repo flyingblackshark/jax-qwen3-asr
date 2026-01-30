@@ -56,6 +56,7 @@ SGL-JAX is designed for easy extension to new model architectures. It currently 
 -   **Llama**: Performance needs to improve.
 -   **Bailing MoE**: Performance needs to improve.
 -   **MiMo-7B**: Support Eagle's Speculative Decoding, Performance needs to improve.
+-   **Qwen3-ASR**: Audio transcription via OpenAI-compatible chat API (base64 audio).
 
 Currently, SGL-JAX already supports MultiModal Models, and its usage is compatible with LLMs. The architecture has been adapted to support flexible multimodal model architectures.
 
@@ -63,6 +64,42 @@ Currently, SGL-JAX already supports MultiModal Models, and its usage is compatib
 -   **Wan 2.2 T2V**: Text-to-Video generation model. Uses different DiT models at different noise stages for denoising, achieving higher generation quality.
 
 For multimodal model usage, see the [Usage Guide](docs/mutlimodal/multimodal_usage.md) and [Architecture Design](docs/mutlimodal/design/[RFC]multimodal_architechure.md).
+
+## ASR (Qwen3-ASR)
+
+SGL-JAX supports Qwen3-ASR with the OpenAI-compatible Chat API. Audio is sent as base64 via `audio_url` and transcribed by the model.
+
+### Dependencies
+
+Audio preprocessing requires extra packages:
+
+```bash
+pip install librosa soundfile
+```
+
+Tokenizer note:
+- Qwen3-ASR uses a Qwen2-style tokenizer. If you are using a local checkpoint, ensure `vocab.json` and `merges.txt` are present. SGL-JAX will auto-patch missing entries in `tokenizer_config.json` when these files exist.
+
+### Example (base64 audio)
+
+```bash
+curl -s http://localhost:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model":"Qwen/Qwen3-ASR-1.7B",
+    "messages":[
+      {"role":"user","content":[{"type":"audio_url","audio_url":{"url":"data:audio/wav;base64,AAA..."}}]}
+    ],
+    "temperature":0.0,
+    "max_tokens":256
+  }'
+```
+
+Notes:
+- Only one audio input is supported per request.
+- The prompt must include a single audio placeholder token (handled automatically by Qwen3-ASR chat template).
+ 
+For a full launch guide, see `docs/basic_usage/asr.md`.
 
 
 ## Performance and Benchmarking

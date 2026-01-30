@@ -30,6 +30,12 @@ def process_content_for_template_format(
     Returns:
         Processed message dictionary
     """
+    if content_format not in ("openai", "string"):
+        if isinstance(msg_dict.get("content"), list):
+            content_format = "openai"
+        else:
+            content_format = "string"
+
     if not isinstance(msg_dict.get("content"), list):
         # Already a string or None, no processing needed
         return {k: v for k, v in msg_dict.items() if v is not None}

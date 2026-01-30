@@ -141,6 +141,11 @@ class TokenizedGenerateReqInput:
     return_routed_experts: list[bool] | bool | None = None
     # whether to return hidden states
     return_hidden_states: bool = False
+    # Audio features for ASR models (optional)
+    audio_features: np.ndarray | None = None
+    audio_attention_mask: np.ndarray | None = None
+    audio_token_start: int | None = None
+    audio_token_len: int | None = None
 
 
 @dataclass
@@ -220,6 +225,8 @@ class GenerateReqInput:
     input_ids: list[list[int]] | list[int] | None = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: list[list[list[float]]] | list[list[float]] | None = None
+    # Optional audio payloads (base64 or data URL)
+    audio_data: list[str] | str | None = None
     sampling_params: Any | None = (
         None  # Using Any for now to avoid SamplingParams serialization issues
     )
@@ -244,6 +251,9 @@ class GenerateReqInput:
     extra_key: list[str] | str | None = None
 
     return_routed_experts: list[bool] | bool | None = None
+
+    def contains_mm_input(self) -> bool:
+        return self.audio_data is not None
 
     def _normalize_rid(self, num):
         """Normalize request IDs for batch processing."""

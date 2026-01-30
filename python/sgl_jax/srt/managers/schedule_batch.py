@@ -168,6 +168,10 @@ class Req:
         vocab_size: int | None = None,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
+        audio_features: np.ndarray | None = None,
+        audio_attention_mask: np.ndarray | None = None,
+        audio_token_start: int | None = None,
+        audio_token_len: int | None = None,
     ):
         # Input and output info
         self.rid = rid
@@ -186,6 +190,12 @@ class Req:
         # Sampling info
         self.sampling_params = sampling_params
         self.return_hidden_states = return_hidden_states
+
+        # Audio inputs (optional, for ASR models)
+        self.audio_features = audio_features
+        self.audio_attention_mask = audio_attention_mask
+        self.audio_token_start = audio_token_start
+        self.audio_token_len = audio_token_len
 
         # Extra key for cache namespace isolation (e.g., cache_salt, lora_id)
         if lora_id is not None:
@@ -1320,6 +1330,37 @@ class ScheduleBatch:
                     [extend_logprob_start_lens, invalid_extend_logprob_start_lens], axis=0
                 )
 
+        audio_features = None
+        audio_attention_mask = None
+        audio_token_start = None
+        audio_token_len = None
+        if self.forward_mode.is_extend():
+            has_audio = any(req.audio_features is not None for req in self.reqs)
+            if has_audio:
+                total_bs = len(seq_lens_cpu)
+                max_audio_len = 0
+                feat_dim = None
+                for req in self.reqs:
+                    if req.audio_features is not None:
+                        max_audio_len = max(max_audio_len, req.audio_features.shape[1])
+                        if feat_dim is None:
+                            feat_dim = req.audio_features.shape[0]
+                if max_audio_len > 0 and feat_dim is not None:
+                    audio_features = np.zeros(
+                        (total_bs, feat_dim, max_audio_len), dtype=np.float32
+                    )
+                    audio_attention_mask = np.zeros((total_bs, max_audio_len), dtype=np.int32)
+                    audio_token_start = np.full((total_bs,), -1, dtype=np.int32)
+                    audio_token_len = np.zeros((total_bs,), dtype=np.int32)
+                    for i, req in enumerate(self.reqs):
+                        if req.audio_features is None:
+                            continue
+                        cur_len = req.audio_features.shape[1]
+                        audio_features[i, :, :cur_len] = req.audio_features
+                        audio_attention_mask[i, :cur_len] = req.audio_attention_mask
+                        audio_token_start[i] = int(req.audio_token_start)
+                        audio_token_len[i] = int(req.audio_token_len)
+
             else:
                 invalid_extend_start_loc = np.array(
                     [len(seq_lens_cpu)] * bs_padding_size, dtype=extend_start_loc.dtype
@@ -1376,6 +1417,37 @@ class ScheduleBatch:
 
         # Extract lora_ids from requests
         lora_ids = [req.lora_id for req in self.reqs]
+
+        audio_features = None
+        audio_attention_mask = None
+        audio_token_start = None
+        audio_token_len = None
+        if self.forward_mode.is_extend():
+            has_audio = any(req.audio_features is not None for req in self.reqs)
+            if has_audio:
+                total_bs = len(seq_lens_cpu)
+                max_audio_len = 0
+                feat_dim = None
+                for req in self.reqs:
+                    if req.audio_features is not None:
+                        max_audio_len = max(max_audio_len, req.audio_features.shape[1])
+                        if feat_dim is None:
+                            feat_dim = req.audio_features.shape[0]
+                if max_audio_len > 0 and feat_dim is not None:
+                    audio_features = np.zeros(
+                        (total_bs, feat_dim, max_audio_len), dtype=np.float32
+                    )
+                    audio_attention_mask = np.zeros((total_bs, max_audio_len), dtype=np.int32)
+                    audio_token_start = np.full((total_bs,), -1, dtype=np.int32)
+                    audio_token_len = np.zeros((total_bs,), dtype=np.int32)
+                    for i, req in enumerate(self.reqs):
+                        if req.audio_features is None:
+                            continue
+                        cur_len = req.audio_features.shape[1]
+                        audio_features[i, :, :cur_len] = req.audio_features
+                        audio_attention_mask[i, :cur_len] = req.audio_attention_mask
+                        audio_token_start[i] = int(req.audio_token_start)
+                        audio_token_len[i] = int(req.audio_token_len)
         # Pad lora_ids to match seq_lens_cpu length (after bs padding)
         if bs_padding_size > 0:
             lora_ids = lora_ids + [None] * bs_padding_size
@@ -1412,6 +1484,10 @@ class ScheduleBatch:
                 CaptureHiddenMode.FULL if self.return_hidden_states else CaptureHiddenMode.NULL
             ),
             launch_done=self.launch_done,
+            audio_features=audio_features,
+            audio_attention_mask=audio_attention_mask,
+            audio_token_start=audio_token_start,
+            audio_token_len=audio_token_len,
         )
 
     def get_spec_model_worker_batch(
@@ -1590,6 +1666,10 @@ class ScheduleBatch:
             spec_info=self.spec_info,
             spec_algorithm=self.spec_algorithm,
             tree_cache=self.tree_cache,
+            audio_features=audio_features,
+            audio_attention_mask=audio_attention_mask,
+            audio_token_start=audio_token_start,
+            audio_token_len=audio_token_len,
         )
 
     def _generate_trace_info(self, real_bs: int, bid: int) -> list[str]:
@@ -1732,6 +1812,12 @@ class ModelWorkerBatch:
     lora_scalings: np.ndarray | None = None
     lora_token_indices: np.ndarray | None = None
     lora_ranks: np.ndarray | None = None
+
+    # Audio inputs (optional)
+    audio_features: np.ndarray | None = None
+    audio_attention_mask: np.ndarray | None = None
+    audio_token_start: np.ndarray | None = None
+    audio_token_len: np.ndarray | None = None
 
     capture_hidden_mode: CaptureHiddenMode = None
 

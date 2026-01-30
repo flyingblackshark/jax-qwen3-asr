@@ -665,6 +665,10 @@ class Scheduler(
             vocab_size=self.model_config.vocab_size,
             return_routed_experts=recv_req.return_routed_experts,
             return_hidden_states=recv_req.return_hidden_states,
+            audio_features=recv_req.audio_features,
+            audio_attention_mask=recv_req.audio_attention_mask,
+            audio_token_start=recv_req.audio_token_start,
+            audio_token_len=recv_req.audio_token_len,
         )
         req.tokenizer = self.tokenizer
 

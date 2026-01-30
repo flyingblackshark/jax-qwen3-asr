@@ -23,6 +23,39 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache uv run python -u -m sgl_jax.launch_serv
     --skip-server-warmup
 ```
 
+## Qwen3-ASR (Audio Transcription)
+
+Qwen3-ASR is supported through the OpenAI-compatible Chat API. Send audio as base64 via `audio_url`.
+
+### Dependencies
+
+```bash
+pip install librosa soundfile
+```
+
+### Tokenizer Notes
+
+Qwen3-ASR uses a Qwen2-style tokenizer. If you are using a local checkpoint, make sure `vocab.json` and `merges.txt` are present next to `tokenizer_config.json`. SGL-JAX will auto-patch missing `vocab_file`/`merges_file` entries when these files exist.
+
+### Example (base64 audio)
+
+```bash
+curl -s http://localhost:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model":"Qwen/Qwen3-ASR-1.7B",
+    "messages":[
+      {"role":"user","content":[{"type":"audio_url","audio_url":{"url":"data:audio/wav;base64,AAA..."}}]}
+    ],
+    "temperature":0.0,
+    "max_tokens":256
+  }'
+```
+
+Notes:
+- Only one audio input is supported per request.
+- The prompt must include a single audio placeholder token (handled automatically by the Qwen3-ASR chat template).
+
 ## Configuration Tips
 
 ### Memory Management

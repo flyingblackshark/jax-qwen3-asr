@@ -422,6 +422,10 @@ class ModelWorker:
             ),
             spec_algorithm=speculative_algotithm,
             lora_ids=lora_ids,  # Already set to [None] * bs above
+            audio_features=None,
+            audio_attention_mask=None,
+            audio_token_start=None,
+            audio_token_len=None,
         )
 
     def get_model_runner(self):
