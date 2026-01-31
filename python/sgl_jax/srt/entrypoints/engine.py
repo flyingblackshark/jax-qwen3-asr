@@ -514,6 +514,39 @@ def _set_envs_and_config(server_args):
     # Set ulimit
     set_ulimit()
 
+    # Keep runtime ASR audio-length bucketing consistent with the warmup buckets.
+    #
+    # schedule_batch.py reads SGLANG_ASR_AUDIO_FRAME_PADDINGS at import time, so this
+    # must happen before we spawn scheduler/worker subprocesses (mp start method is
+    # "spawn" by default).
+    frame_paddings = getattr(server_args, "asr_warmup_audio_frame_paddings", None)
+    if frame_paddings:
+        try:
+            frame_paddings = sorted({int(x) for x in frame_paddings if int(x) > 0})
+        except Exception:
+            frame_paddings = None
+    if frame_paddings:
+        env_val = ",".join(str(x) for x in frame_paddings)
+        prev_val = os.environ.get("SGLANG_ASR_AUDIO_FRAME_PADDINGS")
+        if prev_val != env_val:
+            os.environ["SGLANG_ASR_AUDIO_FRAME_PADDINGS"] = env_val
+            logger.info(
+                "Set SGLANG_ASR_AUDIO_FRAME_PADDINGS=%s (from --asr-warmup-audio-frame-paddings)",
+                env_val,
+            )
+
+        # In single-process mode, modules may already be imported in this process,
+        # so update the cached padding list as well.
+        if getattr(server_args, "enable_single_process", False):
+            try:
+                from sgl_jax.srt.managers import schedule_batch as schedule_batch_mod
+
+                schedule_batch_mod._ASR_AUDIO_FRAME_PADDINGS = list(frame_paddings)
+            except Exception:
+                logger.exception(
+                    "Failed to update schedule_batch._ASR_AUDIO_FRAME_PADDINGS in single-process mode"
+                )
+
     def sigchld_handler(signum, frame):
         pid, exitcode = os.waitpid(0, os.WNOHANG)
         if exitcode != 0:

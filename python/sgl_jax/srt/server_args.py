@@ -67,6 +67,7 @@ class ServerArgs:
     enable_mixed_chunk: bool = False
     schedule_policy: str = "fcfs"
     schedule_conservativeness: float = 1.0
+    decode_first: bool = False
     page_size: int = 1
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
@@ -526,6 +527,12 @@ class ServerArgs:
             type=float,
             default=ServerArgs.schedule_conservativeness,
             help="How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
+        )
+        parser.add_argument(
+            "--decode-first",
+            action="store_true",
+            help="Prefer decode batches over admitting new prefill batches when there are running requests. "
+            "This improves inter-token latency stability but may reduce throughput for high-QPS workloads.",
         )
         parser.add_argument(
             "--page-size",

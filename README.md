@@ -111,22 +111,46 @@ On TPU, the first ASR request for a new (token padding, audio length bucket) can
 You can precompile this path during server startup:
 
 ```bash
+export JAX_COMPILATION_CACHE_DIR=/tmp/jax_cache  # optional but recommended
+
 python -u -m sgl_jax.launch_server \
   --model-path Qwen/Qwen3-ASR-1.7B \
   --trust-remote-code \
   --device tpu \
   --tp-size 4 \
+  --dp-size 2 \
   --dtype bfloat16 \
   --page-size 32 \
   --asr-warmup-audio \
-  --asr-warmup-audio-frame-paddings 1024 \
-  --asr-warmup-audio-token-paddings 256
+  --asr-warmup-audio-frame-paddings 64 128 256 512 1024 2048 3000 \
+  --asr-warmup-audio-token-paddings 256 512 1024 2048 4096 8192 16384
 ```
 
 Options:
 - `--asr-warmup-audio`: enable ASR audio-path warmup at startup.
 - `--asr-warmup-audio-frame-paddings`: which audio frame buckets to warm up (frames at hop_length=160 by default). If unset, uses `SGLANG_ASR_AUDIO_FRAME_PADDINGS`.
-- `--asr-warmup-audio-token-paddings`: which token padding buckets to warm up for ASR prefill (default `[256]`). If you see compilation on a different token bucket (e.g. `tok=(64,)`), add it here.
+- `--asr-warmup-audio-token-paddings`: which token padding buckets to warm up for ASR prefill (default `[256]`). If you still see `#cache_miss: 1` on prefill, it is usually because your real request hit a new token padding bucket (e.g. 4096/8192/16384) that was not warmed up.
+
+Notes:
+- On TPU v6e-8 (8 cores), `--tp-size 4 --dp-size 2` uses all 8 cores. On smaller slices (e.g. v6e-4), keep `--dp-size 1`.
+- If you pass `--disable-precompile`, you should expect runtime `#cache_miss: 1` logs when a request hits a new bucket. For throughput testing, keep precompile enabled and use `JAX_COMPILATION_CACHE_DIR` so restarts can reuse compiled executables.
+- `#cache_miss` here means a JAX/XLA compilation cache miss (not a KV/prefix-cache miss).
+- Audio frame paddings are in "frames", not samples. With 16kHz audio and hop_length=160, 1 frame ~= 10ms, so 100 frames ~= 1 second.
+- If `--asr-warmup-audio-frame-paddings` is set, SGL-JAX will automatically set `SGLANG_ASR_AUDIO_FRAME_PADDINGS` to the same list so runtime bucketing matches warmup.
+- If your audio can exceed ~30s, increase the buckets (e.g. add 4096 and/or 6000) and keep the warmup buckets consistent with your runtime bucket list.
+
+### Debugging ASR Cache Misses
+
+Enable cache-miss breakdown logs:
+
+```bash
+export SGLANG_LOG_CACHE_MISS=1
+```
+
+This prints:
+- `forward_miss`: misses from model forward / attention kernels
+- `sample_miss`: misses from sampling
+- `padded_tokens` / `padded_bs`: which padding bucket triggered a (re)compile
 
 
 ## Performance and Benchmarking

@@ -353,7 +353,9 @@ def _ragged_paged_attention_kernel(
     assert head_dim % 128 == 0
     bkv_sz = bkv_p * page_size
     seq_idx = pl.program_id(0)
-    num_seqs = pl.num_programs(0)
+    # `pl.num_programs(0)` is the static grid size (padded max_num_seqs).
+    # The actual number of active sequences is dynamic and comes from `distribution_ref[2]`.
+    num_seqs = distribution_ref[2]
     decode_end = distribution_ref[0]
     prefill_end = distribution_ref[1]
     mixed_end = distribution_ref[2]
@@ -1513,7 +1515,12 @@ def ragged_paged_attention(
 
         custom_mask = jnp.repeat(jnp.expand_dims(custom_mask, axis=1), repeats=head_dim, axis=1)
 
-    grid = (distribution[2],)
+    # NOTE: Keep the pallas grid static to avoid recompiling when the number of
+    # *active* sequences changes (e.g. decode bs fluctuates between 59..64).
+    #
+    # The active seq range is controlled by `distribution` (decode_end/prefill_end/mixed_end),
+    # so extra "padded" seq slots are simply skipped inside the kernel.
+    grid = (max_num_seqs,)
 
     in_specs = [
         pl.BlockSpec(memory_space=pltpu.ANY),  # q

@@ -26,6 +26,7 @@ from sgl_jax.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 PERF_BREAKDOWN = get_bool_env_var("SGLANG_PERF_BREAKDOWN")
+PERF_BLOCK_UNTIL_READY = get_bool_env_var("SGLANG_PERF_BLOCK_UNTIL_READY")
 PERF_LOG_EVERY = int(os.environ.get("SGLANG_PERF_LOG_EVERY", "1") or "1")
 PERF_SLOW_MS = float(os.environ.get("SGLANG_PERF_SLOW_MS", "0") or "0")
 
@@ -56,6 +57,14 @@ class ModelWorkerClient:
         # Launch threads
         self.input_queue = Queue()
         self.output_queue = Queue()
+        # Exposed for scheduler-side metrics/debugging.
+        self.last_exec_time_s = 0.0
+        self.last_forward_mode = None
+        self.last_real_bs = 0
+        self.last_bid = -1
+        self.last_output_queue_wait_s = 0.0
+        self.last_device_get_s = 0.0
+        self.last_launch_wait_s = 0.0
         # JAX handles device execution automatically, no need for explicit streams
         self.forward_thread = threading.Thread(
             target=self.forward_thread_func,
@@ -114,6 +123,7 @@ class ModelWorkerClient:
             )
 
             # Run forward
+            t_exec0 = time.perf_counter()
             with jax.profiler.TraceAnnotation(f"forward_batch_generation {model_worker_batch.bid}"):
                 logits_output, next_token_ids, cache_miss_count = (
                     self.worker.forward_batch_generation(
@@ -123,6 +133,11 @@ class ModelWorkerClient:
                         forward_metadata=forward_metadata,
                     )
                 )
+            if PERF_BLOCK_UNTIL_READY:
+                # In JAX, dispatch is async. This makes exec_time_s reflect true device time,
+                # at the cost of overlap (debug/perf profiling only).
+                jax.block_until_ready(next_token_ids)
+            exec_time_s = time.perf_counter() - t_exec0
 
             # Update the future token ids map
             self.future_token_ids_map = set_future_token_ids(
@@ -131,7 +146,15 @@ class ModelWorkerClient:
                 next_token_ids,
             )
             self.output_queue.put(
-                (model_worker_batch.bid, logits_output, next_token_ids, cache_miss_count)
+                (
+                    model_worker_batch.bid,
+                    model_worker_batch.forward_mode,
+                    int(model_worker_batch.real_bs or 0),
+                    float(exec_time_s),
+                    logits_output,
+                    next_token_ids,
+                    cache_miss_count,
+                )
             )
 
     def resolve_last_batch_result(self, launch_done: threading.Event | None = None):
@@ -139,16 +162,36 @@ class ModelWorkerClient:
         This function is called to resolve the last batch result and
         wait for the current batch to be launched. Used in overlap mode.
         """
-        bid, logits_output, next_token_ids, cache_miss_count = self.output_queue.get()
+        t0 = time.perf_counter()
+        (
+            bid,
+            forward_mode,
+            real_bs,
+            exec_time_s,
+            logits_output,
+            next_token_ids,
+            cache_miss_count,
+        ) = self.output_queue.get()
+        output_queue_wait_s = time.perf_counter() - t0
         perf_enabled = PERF_BREAKDOWN and (PERF_LOG_EVERY <= 1 or (bid % PERF_LOG_EVERY == 0))
-        perf_t0 = time.perf_counter() if perf_enabled else 0.0
+        perf_t0 = t0 if perf_enabled else 0.0
         perf = {} if perf_enabled else None
 
         def _pmark(name: str, t0: float) -> None:
             if perf_enabled:
                 perf[name] = time.perf_counter() - t0
 
-        t = time.perf_counter() if perf_enabled else 0.0
+        if perf_enabled:
+            perf["output_queue_wait_s"] = output_queue_wait_s
+
+        # Expose last batch timing for scheduler-side metrics (decode-only throughput).
+        self.last_exec_time_s = float(exec_time_s)
+        self.last_forward_mode = forward_mode
+        self.last_real_bs = int(real_bs)
+        self.last_bid = bid
+        self.last_output_queue_wait_s = float(output_queue_wait_s)
+
+        t_device_get0 = time.perf_counter()
         if logits_output.next_token_logprobs is not None:
             logits_output.next_token_logprobs = jax.device_get(
                 logits_output.next_token_logprobs
@@ -160,12 +203,18 @@ class ModelWorkerClient:
         if logits_output.hidden_states is not None:
             logits_output.hidden_states = jax.device_get(logits_output.hidden_states)
         next_token_ids = jax.device_get(next_token_ids).tolist()
-        _pmark("device_get_s", t)
+        device_get_s = time.perf_counter() - t_device_get0
+        self.last_device_get_s = float(device_get_s)
+        if perf_enabled:
+            perf["device_get_s"] = device_get_s
 
         if launch_done is not None:
-            t = time.perf_counter() if perf_enabled else 0.0
+            t_launch0 = time.perf_counter()
             launch_done.wait()
-            _pmark("launch_wait_s", t)
+            launch_wait_s = time.perf_counter() - t_launch0
+            self.last_launch_wait_s = float(launch_wait_s)
+            if perf_enabled:
+                perf["launch_wait_s"] = launch_wait_s
 
         if perf_enabled:
             total_s = time.perf_counter() - perf_t0

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from sgl_jax.srt.managers.schedule_policy import PrefillAdder
 from sgl_jax.srt.managers.scheduler import Req, ScheduleBatch
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
@@ -124,6 +125,21 @@ class SchedulerMetricsMixin:
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}, "
         )
+
+        # In overlap mode, expose per-step worker timing so "gen throughput" doesn't look jittery
+        # when the gap includes prefill/compile/queueing time.
+        if getattr(self, "enable_overlap", False) and getattr(self, "tp_worker", None) is not None:
+            w = self.tp_worker
+            if getattr(w, "last_forward_mode", None) == ForwardMode.DECODE:
+                step_s = float(getattr(w, "last_output_queue_wait_s", 0.0)) + float(
+                    getattr(w, "last_device_get_s", 0.0)
+                )
+                step_bs = int(getattr(w, "last_real_bs", num_running_reqs) or num_running_reqs)
+                if step_s > 0:
+                    msg += (
+                        f"step throughput (token/s): {step_bs / step_s:.2f}, "
+                        f"step_ms: {step_s * 1000.0:.1f}, "
+                    )
 
         if batch.cache_miss_count > 0:
             msg += f"#cache_miss: {batch.cache_miss_count}"

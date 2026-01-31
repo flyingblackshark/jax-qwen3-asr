@@ -1101,21 +1101,24 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
 
-        new_batch = self.get_new_batch_prefill()
+        # Optional: prefer decode to keep inter-token latency stable.
+        # This is useful for streaming/interactive workloads, but can reduce throughput
+        # because it delays admitting new requests until the running batch drains.
+        if getattr(self.server_args, "decode_first", False) and not self.running_batch.is_empty():
+            self.running_batch = self.update_running_batch(self.running_batch)
+            if not self.running_batch.is_empty():
+                return self.running_batch
 
-        # if new_batch is not None:
+        new_batch = self.get_new_batch_prefill()
         if new_batch:
             # Run prefill first if possible
-            ret = new_batch
-        else:
-            # Run decode
-            if not self.running_batch.is_empty():
-                self.running_batch = self.update_running_batch(self.running_batch)
-                ret = self.running_batch if not self.running_batch.is_empty() else None
-            else:
-                ret = None
+            return new_batch
 
-        return ret
+        # Run decode
+        if not self.running_batch.is_empty():
+            self.running_batch = self.update_running_batch(self.running_batch)
+            return self.running_batch if not self.running_batch.is_empty() else None
+        return None
 
     def get_new_batch_prefill(self) -> ScheduleBatch | None:
         if self.grammar_queue:

@@ -49,6 +49,7 @@ PERF_BREAKDOWN = get_bool_env_var("SGLANG_PERF_BREAKDOWN")
 PERF_BLOCK_UNTIL_READY = get_bool_env_var("SGLANG_PERF_BLOCK_UNTIL_READY")
 PERF_LOG_EVERY = int(os.environ.get("SGLANG_PERF_LOG_EVERY", "1") or "1")
 PERF_SLOW_MS = float(os.environ.get("SGLANG_PERF_SLOW_MS", "0") or "0")
+LOG_CACHE_MISS = get_bool_env_var("SGLANG_LOG_CACHE_MISS")
 
 
 def _asr_feat_extract_output_length(input_frames: int) -> int:
@@ -495,7 +496,7 @@ class ModelWorker:
         if invalid_cache_loc_size < 0:
             raise ValueError(f"padding cache_loc_size {invalid_cache_loc_size} < 0!")
 
-        valid_cache_loc = np.arange(bs)
+        valid_cache_loc = np.arange(bs, dtype=jnp.int32)
         invalid_cache_loc = np.array([0] * (invalid_cache_loc_size), dtype=jnp.int32)
         lora_ids = ["0"] * bs
 
@@ -519,10 +520,14 @@ class ModelWorker:
             ),
             extend_input_logprob_token_ids=None,
             positions=np.concat([valid_positions, invalid_positions], axis=0),
-            extend_start_loc=np.arange(bs, dtype=np.int64),
+            extend_start_loc=np.arange(bs, dtype=np.int32),
             cache_loc=np.concat([valid_cache_loc, invalid_cache_loc], axis=0),
-            extend_prefix_lens=(np.array([0] * bs) if mode == ForwardMode.EXTEND else None),
-            extend_seq_lens=np.array([1] * bs) if mode == ForwardMode.EXTEND else None,
+            extend_prefix_lens=(
+                np.array([0] * bs, dtype=np.int32) if mode == ForwardMode.EXTEND else None
+            ),
+            extend_seq_lens=(
+                np.array([1] * bs, dtype=np.int32) if mode == ForwardMode.EXTEND else None
+            ),
             top_logprobs_nums=None,
             token_ids_logprobs=None,
             extend_logprob_start_lens=None,
@@ -663,7 +668,7 @@ class ModelWorker:
 
         self.model_runner.attn_backend.forward_metadata = forward_metadata
         t_forward = time.perf_counter() if perf_enabled else 0.0
-        logits_output, cache_miss_count, layers_topk_ids = self.model_runner.forward(
+        logits_output, forward_cache_miss, layers_topk_ids = self.model_runner.forward(
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
         )
@@ -697,6 +702,7 @@ class ModelWorker:
         if skip_sample:
             next_token_ids_device = None
             new_logits_output = None
+            sample_cache_miss = 0
         else:
             import jax._src.test_util as jtu
 
@@ -715,12 +721,35 @@ class ModelWorker:
                     t = time.perf_counter()
                     _block_until_ready(next_token_ids_device)
                     _pmark("sample_block_s", t)
-                cache_miss_count += count()
+                sample_cache_miss = int(count() or 0)
             if model_worker_batch.return_output_logprob_only:
                 t_logprob = time.perf_counter() if perf_enabled else 0.0
                 logprobs = self.model_runner.compute_logprobs(token_logprobs, next_token_ids_device)
                 logits_output.next_token_logprobs = logprobs[: model_worker_batch.real_bs]
                 _pmark("compute_logprobs_s", t_logprob)
+
+        cache_miss_count = int(forward_cache_miss or 0) + int(sample_cache_miss or 0)
+
+        if LOG_CACHE_MISS and cache_miss_count > 0:
+            try:
+                dist = None
+                if forward_metadata is not None and getattr(forward_metadata, "distribution", None) is not None:
+                    dist = jax.device_get(forward_metadata.distribution).tolist()
+                logger.info(
+                    "[CACHE_MISS] mode=%s bid=%s real_bs=%d padded_bs=%d real_tokens=%d padded_tokens=%d "
+                    "forward_miss=%d sample_miss=%d dist=%s",
+                    str(model_worker_batch.forward_mode),
+                    int(getattr(model_worker_batch, "bid", -1)),
+                    int(model_worker_batch.real_bs or 0),
+                    int(len(model_worker_batch.seq_lens) if model_worker_batch.seq_lens is not None else 0),
+                    int(getattr(model_worker_batch, "real_input_ids_len", 0) or 0),
+                    int(len(model_worker_batch.input_ids) if model_worker_batch.input_ids is not None else 0),
+                    int(forward_cache_miss or 0),
+                    int(sample_cache_miss or 0),
+                    dist,
+                )
+            except Exception:
+                logger.exception("Failed to log cache-miss breakdown")
         if new_logits_output is not None:
             logits_output = new_logits_output
             if logits_output.next_token_top_logprobs_val is not None:

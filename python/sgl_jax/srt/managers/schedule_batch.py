@@ -1376,6 +1376,15 @@ class ScheduleBatch:
                 extend_logprob_start_lens = np.concat(
                     [extend_logprob_start_lens, invalid_extend_logprob_start_lens], axis=0
                 )
+            else:
+                # Keep JAX shapes stable in decode mode. `extend_start_loc` is not
+                # used by decode kernels, but it is part of ForwardBatch inputs.
+                # If we leave it unpadded, its shape changes with real_bs and
+                # triggers JIT recompiles / cache misses.
+                invalid_extend_start_loc = np.array(
+                    [0] * bs_padding_size, dtype=extend_start_loc.dtype
+                )
+                extend_start_loc = np.concat([extend_start_loc, invalid_extend_start_loc], axis=0)
 
         sampling_info = self.sampling_info
         if self.sampling_info:
