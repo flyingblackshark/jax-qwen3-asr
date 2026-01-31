@@ -71,10 +71,10 @@ SGL-JAX supports Qwen3-ASR with the OpenAI-compatible Chat API. Audio is sent as
 
 ### Dependencies
 
-Audio preprocessing requires extra packages:
+Audio decoding requires extra packages:
 
 ```bash
-pip install librosa soundfile
+pip install soundfile
 ```
 
 Tokenizer note:
@@ -88,7 +88,10 @@ curl -s http://localhost:30000/v1/chat/completions \
   -d '{
     "model":"Qwen/Qwen3-ASR-1.7B",
     "messages":[
-      {"role":"user","content":[{"type":"audio_url","audio_url":{"url":"data:audio/wav;base64,AAA..."}}]}
+      {"role":"user","content":[
+        {"type":"text","text":"<|audio_pad|>"},
+        {"type":"audio_url","audio_url":{"url":"data:audio/wav;base64,AAA..."}}
+      ]}
     ],
     "temperature":0.0,
     "max_tokens":256
@@ -97,9 +100,33 @@ curl -s http://localhost:30000/v1/chat/completions \
 
 Notes:
 - Only one audio input is supported per request.
-- The prompt must include a single audio placeholder token (handled automatically by Qwen3-ASR chat template).
+- The prompt must include an audio placeholder token (e.g. `<|audio_pad|>`), otherwise the server will reject the request.
  
 For a full launch guide, see `docs/basic_usage/asr.md`.
+
+### ASR Warmup (Avoid First-Request JAX Compile Latency)
+
+On TPU, the first ASR request for a new (token padding, audio length bucket) can be slow due to JAX/XLA compilation of the audio feature extraction + audio encoder path.
+
+You can precompile this path during server startup:
+
+```bash
+python -u -m sgl_jax.launch_server \
+  --model-path Qwen/Qwen3-ASR-1.7B \
+  --trust-remote-code \
+  --device tpu \
+  --tp-size 4 \
+  --dtype bfloat16 \
+  --page-size 32 \
+  --asr-warmup-audio \
+  --asr-warmup-audio-frame-paddings 1024 \
+  --asr-warmup-audio-token-paddings 256
+```
+
+Options:
+- `--asr-warmup-audio`: enable ASR audio-path warmup at startup.
+- `--asr-warmup-audio-frame-paddings`: which audio frame buckets to warm up (frames at hop_length=160 by default). If unset, uses `SGLANG_ASR_AUDIO_FRAME_PADDINGS`.
+- `--asr-warmup-audio-token-paddings`: which token padding buckets to warm up for ASR prefill (default `[256]`). If you see compilation on a different token bucket (e.g. `tok=(64,)`), add it here.
 
 
 ## Performance and Benchmarking

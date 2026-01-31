@@ -140,6 +140,13 @@ class ServerArgs:
 
     disable_precompile: bool = False
 
+    # ASR warmup (JAX compile) options
+    # When enabled, runs extra extend precompile passes that include dummy audio waveforms
+    # to compile the Whisper log-mel + audio tower path on TPU ahead of time.
+    asr_warmup_audio: bool = False
+    asr_warmup_audio_frame_paddings: list[int] | None = None
+    asr_warmup_audio_token_paddings: list[int] | None = None
+
     # Speculative decoding
     speculative_algorithm: str | None = None
     speculative_draft_model_path: str | None = None
@@ -826,6 +833,36 @@ class ServerArgs:
             "--disable-precompile",
             action="store_true",
             help="whether disable precompile",
+        )
+
+        # ASR warmup (compile audio path ahead of time)
+        parser.add_argument(
+            "--asr-warmup-audio",
+            action="store_true",
+            help=(
+                "Warm up the ASR audio path (Whisper log-mel + audio tower) during startup "
+                "to avoid the first-request JAX compilation latency."
+            ),
+        )
+        parser.add_argument(
+            "--asr-warmup-audio-frame-paddings",
+            type=int,
+            nargs="+",
+            default=ServerArgs.asr_warmup_audio_frame_paddings,
+            help=(
+                "Audio frame bucket(s) to warm up (frames at hop_length=160 by default). "
+                "If unset, uses SGLANG_ASR_AUDIO_FRAME_PADDINGS."
+            ),
+        )
+        parser.add_argument(
+            "--asr-warmup-audio-token-paddings",
+            type=int,
+            nargs="+",
+            default=ServerArgs.asr_warmup_audio_token_paddings,
+            help=(
+                "Token padding bucket(s) to warm up for ASR prefill. "
+                "If unset, defaults to [256]."
+            ),
         )
         # Kernel backend
         parser.add_argument(

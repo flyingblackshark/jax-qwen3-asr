@@ -2,8 +2,10 @@
 
 import dataclasses
 import logging
+import os
 import signal
 import threading
+import time
 from queue import Queue
 
 import jax
@@ -18,9 +20,14 @@ from sgl_jax.srt.managers.utils import resolve_future_token_ids, set_future_toke
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
+from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+PERF_BREAKDOWN = get_bool_env_var("SGLANG_PERF_BREAKDOWN")
+PERF_LOG_EVERY = int(os.environ.get("SGLANG_PERF_LOG_EVERY", "1") or "1")
+PERF_SLOW_MS = float(os.environ.get("SGLANG_PERF_SLOW_MS", "0") or "0")
 
 
 class ModelWorkerClient:
@@ -123,14 +130,25 @@ class ModelWorkerClient:
                 future_token_ids_ct,
                 next_token_ids,
             )
-            self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
+            self.output_queue.put(
+                (model_worker_batch.bid, logits_output, next_token_ids, cache_miss_count)
+            )
 
     def resolve_last_batch_result(self, launch_done: threading.Event | None = None):
         """
         This function is called to resolve the last batch result and
         wait for the current batch to be launched. Used in overlap mode.
         """
-        _, logits_output, next_token_ids, cache_miss_count = self.output_queue.get()
+        bid, logits_output, next_token_ids, cache_miss_count = self.output_queue.get()
+        perf_enabled = PERF_BREAKDOWN and (PERF_LOG_EVERY <= 1 or (bid % PERF_LOG_EVERY == 0))
+        perf_t0 = time.perf_counter() if perf_enabled else 0.0
+        perf = {} if perf_enabled else None
+
+        def _pmark(name: str, t0: float) -> None:
+            if perf_enabled:
+                perf[name] = time.perf_counter() - t0
+
+        t = time.perf_counter() if perf_enabled else 0.0
         if logits_output.next_token_logprobs is not None:
             logits_output.next_token_logprobs = jax.device_get(
                 logits_output.next_token_logprobs
@@ -142,9 +160,31 @@ class ModelWorkerClient:
         if logits_output.hidden_states is not None:
             logits_output.hidden_states = jax.device_get(logits_output.hidden_states)
         next_token_ids = jax.device_get(next_token_ids).tolist()
+        _pmark("device_get_s", t)
 
         if launch_done is not None:
+            t = time.perf_counter() if perf_enabled else 0.0
             launch_done.wait()
+            _pmark("launch_wait_s", t)
+
+        if perf_enabled:
+            total_s = time.perf_counter() - perf_t0
+            max_stage = ("", 0.0)
+            if perf:
+                max_stage = max(perf.items(), key=lambda kv: kv[1])
+            if PERF_SLOW_MS <= 0 or (total_s * 1000.0) >= PERF_SLOW_MS:
+                breakdown = ", ".join(
+                    f"{k}={v:.4f}s" for k, v in sorted(perf.items(), key=lambda kv: -kv[1])
+                )
+                logger.info(
+                    "[PERF][overlap_result] bid=%s miss=%d total=%.4fs max=%s=%.4fs breakdown={%s}",
+                    bid,
+                    int(cache_miss_count or 0),
+                    total_s,
+                    max_stage[0],
+                    max_stage[1],
+                    breakdown,
+                )
 
         return logits_output, next_token_ids, cache_miss_count
 
@@ -153,36 +193,57 @@ class ModelWorkerClient:
         model_worker_batch: ModelWorkerBatch,
         sampling_metadata: SamplingMetadata = None,
     ) -> tuple[None, jax.Array, int]:
+        perf_enabled = PERF_BREAKDOWN and (
+            PERF_LOG_EVERY <= 1 or (model_worker_batch.bid % PERF_LOG_EVERY == 0)
+        )
+        perf_t0 = time.perf_counter() if perf_enabled else 0.0
+        perf = {} if perf_enabled else None
+
+        def _pmark(name: str, t0: float) -> None:
+            if perf_enabled:
+                perf[name] = time.perf_counter() - t0
+
         # Create a new copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
         sampling_info = model_worker_batch.sampling_info
+        t = time.perf_counter() if perf_enabled else 0.0
         sampling_info.update_penalties()
         model_worker_batch.sampling_info = self.cur_sampling_info = dataclasses.replace(
             sampling_info,
             sampling_info_done=threading.Event(),
             penalizer_orchestrator=None,
         )
+        _pmark("sampling_info_copy_s", t)
 
         if sampling_metadata is None:
+            t = time.perf_counter() if perf_enabled else 0.0
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
                 model_worker_batch,
                 len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
                 self.mesh,
                 self.worker.model_config.vocab_size,
             )
+            _pmark("sampling_metadata_s", t)
 
+        t = time.perf_counter() if perf_enabled else 0.0
         forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
             model_worker_batch
         )
+        _pmark("forward_metadata_s", t)
 
         # Prepare LoRA batch if LoRA is enabled
         if self.worker.server_args.enable_lora:
+            t = time.perf_counter() if perf_enabled else 0.0
             self.worker.prepare_lora_batch(model_worker_batch)
+            _pmark("lora_prepare_s", t)
 
+        t = time.perf_counter() if perf_enabled else 0.0
         model_worker_batch.forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.worker.get_model_runner()
         )
+        _pmark("forward_batch_init_s", t)
 
         # Push a new batch to the queue (JAX handles synchronization automatically)
+        t = time.perf_counter() if perf_enabled else 0.0
         self.input_queue.put(
             (
                 model_worker_batch,
@@ -191,6 +252,7 @@ class ModelWorkerClient:
                 forward_metadata,
             )
         )
+        _pmark("queue_put_s", t)
 
         # Allocate output future objects
         bs = len([seq_len for seq_len in model_worker_batch.seq_lens if seq_len > 0])
@@ -202,6 +264,27 @@ class ModelWorkerClient:
             dtype=np.int32,
         )
         self.future_token_ids_ct = (self.future_token_ids_ct + bs) % self.future_token_ids_limit
+
+        if perf_enabled:
+            total_s = time.perf_counter() - perf_t0
+            max_stage = ("", 0.0)
+            if perf:
+                max_stage = max(perf.items(), key=lambda kv: kv[1])
+            if PERF_SLOW_MS <= 0 or (total_s * 1000.0) >= PERF_SLOW_MS:
+                breakdown = ", ".join(
+                    f"{k}={v:.4f}s" for k, v in sorted(perf.items(), key=lambda kv: -kv[1])
+                )
+                logger.info(
+                    "[PERF][overlap_submit] mode=%s bid=%s bs=%d total=%.4fs max=%s=%.4fs breakdown={%s}",
+                    str(model_worker_batch.forward_mode),
+                    model_worker_batch.bid,
+                    int(model_worker_batch.real_bs or 0),
+                    total_s,
+                    max_stage[0],
+                    max_stage[1],
+                    breakdown,
+                )
+
         return None, future_next_token_ids, 0
 
     def run_precompile(self):

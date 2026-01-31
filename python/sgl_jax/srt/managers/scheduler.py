@@ -87,6 +87,9 @@ logger = logging.getLogger(__name__)
 TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
+PERF_BREAKDOWN = get_bool_env_var("SGLANG_PERF_BREAKDOWN")
+PERF_LOG_EVERY = int(os.environ.get("SGLANG_PERF_LOG_EVERY", "1") or "1")
+PERF_SLOW_MS = float(os.environ.get("SGLANG_PERF_SLOW_MS", "0") or "0")
 
 
 class SyncError(Exception):
@@ -669,6 +672,9 @@ class Scheduler(
             audio_attention_mask=recv_req.audio_attention_mask,
             audio_token_start=recv_req.audio_token_start,
             audio_token_len=recv_req.audio_token_len,
+            audio_waveform=recv_req.audio_waveform,
+            audio_waveform_len=recv_req.audio_waveform_len,
+            audio_sampling_rate=recv_req.audio_sampling_rate,
         )
         req.tokenizer = self.tokenizer
 
@@ -1277,6 +1283,14 @@ class Scheduler(
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
 
+        perf_enabled = PERF_BREAKDOWN and (PERF_LOG_EVERY <= 1 or (self.forward_ct % PERF_LOG_EVERY == 0))
+        perf_t0 = time.perf_counter() if perf_enabled else 0.0
+        perf = {} if perf_enabled else None
+
+        def _pmark(name: str, t0: float) -> None:
+            if perf_enabled:
+                perf[name] = time.perf_counter() - t0
+
         # Run forward
         assert self.is_generation
         (
@@ -1285,6 +1299,7 @@ class Scheduler(
             precompile_cache_loc_paddings,
         ) = self.tp_worker.get_precompile_paddings()
         if self.spec_algorithm is None or self.spec_algorithm.is_none():
+            t = time.perf_counter() if perf_enabled else 0.0
             model_worker_batch = batch.get_model_worker_batch(
                 precompile_token_paddings,
                 precompile_bs_paddings,
@@ -1292,27 +1307,34 @@ class Scheduler(
                 self.page_size,
                 self.server_args.enable_static_lora,
             )
+            _pmark("build_model_worker_batch_s", t)
 
             if self.enable_overlap:
                 with jax.profiler.TraceAnnotation(
                     f"forward_batch_generation_overlap {self.forward_ct}"
                 ):
 
+                    t = time.perf_counter() if perf_enabled else 0.0
                     logits_output, next_token_ids, cache_miss_count = (
                         self.tp_worker.forward_batch_generation(
                             model_worker_batch, sampling_metadata=None
                         )
                     )
+                    _pmark("overlap_submit_s", t)
                 next_token_ids = next_token_ids[: model_worker_batch.real_bs]
             else:
+                t = time.perf_counter() if perf_enabled else 0.0
                 logits_output, next_token_ids_device, cache_miss_count = (
                     self.tp_worker.forward_batch_generation(
                         model_worker_batch, sampling_metadata=None
                     )
                 )
+                _pmark("forward_call_s", t)
+                t = time.perf_counter() if perf_enabled else 0.0
                 next_token_ids = np.array(jax.device_get(next_token_ids_device))[
                     : model_worker_batch.real_bs
                 ]
+                _pmark("next_token_device_get_s", t)
         else:
             model_worker_batch = batch.get_spec_model_worker_batch(
                 precompile_token_paddings,
@@ -1357,6 +1379,29 @@ class Scheduler(
             bid=bid,
             cache_miss_count=cache_miss_count,
         )
+
+        if perf_enabled:
+            total_s = time.perf_counter() - perf_t0
+            max_stage = ("", 0.0)
+            if perf:
+                max_stage = max(perf.items(), key=lambda kv: kv[1])
+            if PERF_SLOW_MS <= 0 or (total_s * 1000.0) >= PERF_SLOW_MS:
+                breakdown = ", ".join(
+                    f"{k}={v:.4f}s" for k, v in sorted(perf.items(), key=lambda kv: -kv[1])
+                )
+                logger.info(
+                    "[PERF][scheduler_run_batch] forward_ct=%d mode=%s bid=%s bs=%d miss=%d total=%.4fs max=%s=%.4fs breakdown={%s}",
+                    self.forward_ct,
+                    str(batch.forward_mode),
+                    bid,
+                    int(getattr(model_worker_batch, "real_bs", 0) or 0),
+                    int(cache_miss_count or 0),
+                    total_s,
+                    max_stage[0],
+                    max_stage[1],
+                    breakdown,
+                )
+
         if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
             assert isinstance(batch_output.next_draft_input, EagleDraftInput)
             ret.next_draft_input = batch_output.next_draft_input

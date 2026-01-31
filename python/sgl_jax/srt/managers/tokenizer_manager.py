@@ -15,8 +15,8 @@ import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict, deque
 from io import BytesIO
-from collections import deque
 from datetime import datetime
 from http import HTTPStatus
 from typing import Any
@@ -78,13 +78,14 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 logger = logging.getLogger(__name__)
 
+PERF_TOKENIZE = get_bool_env_var("SGLANG_PERF_TOKENIZE")
+PERF_LOG_EVERY = int(os.environ.get("SGLANG_PERF_LOG_EVERY", "1") or "1")
+PERF_SLOW_MS = float(os.environ.get("SGLANG_PERF_SLOW_MS", "0") or "0")
+
 try:
-    import librosa
     import soundfile as sf
 except Exception:  # pragma: no cover - optional deps
-    librosa = None
     sf = None
-
 
 def _linear_resample(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
     if orig_sr == target_sr:
@@ -195,6 +196,12 @@ class TokenizerManager:
 
         self.feature_extractor = None
         self.audio_sampling_rate = None
+        self.audio_hop_length = None
+        self.audio_max_samples = None
+        default_model_side = "true" if server_args.device != "cpu" else "false"
+        self.asr_use_model_feature_extractor = get_bool_env_var(
+            "SGLANG_ASR_USE_MODEL_FEATURE_EXTRACTOR", default=default_model_side
+        )
         if self.audio_token_id is None and self.tokenizer is not None:
             self.audio_token_id = getattr(self.tokenizer, "audio_token_id", None)
 
@@ -203,16 +210,33 @@ class TokenizerManager:
             and not server_args.skip_tokenizer_init
             and self.model_path is not None
         ):
-            if librosa is None or sf is None:
+            if sf is None:
                 raise RuntimeError(
-                    "Audio dependencies missing. Install librosa and soundfile to use audio inputs."
+                    "Audio dependency missing. Install soundfile to use audio inputs."
                 )
-            self.feature_extractor = WhisperFeatureExtractor.from_pretrained(
+            whisper_fe = WhisperFeatureExtractor.from_pretrained(
                 self.model_path,
                 revision=server_args.revision,
                 trust_remote_code=server_args.trust_remote_code,
             )
-            self.audio_sampling_rate = int(self.feature_extractor.sampling_rate)
+            self.audio_sampling_rate = int(whisper_fe.sampling_rate)
+            self.audio_hop_length = int(getattr(whisper_fe, "hop_length", 160))
+            self.audio_max_samples = int(getattr(whisper_fe, "n_samples", 30 * self.audio_sampling_rate))
+            if not self.asr_use_model_feature_extractor:
+                self.feature_extractor = whisper_fe
+            # Optional in-memory cache to speed up repeated ASR requests for identical audio.
+            # Keyed by SHA1(audio_bytes). Useful for throughput tests that replay the same clip.
+            self.asr_feature_cache_size = (
+                max(int(os.environ.get("SGLANG_ASR_FEATURE_CACHE_SIZE", "0")), 0)
+                if self.feature_extractor is not None
+                else 0
+            )
+            self.asr_feature_cache: OrderedDict[
+                str, tuple[np.ndarray, np.ndarray, int]
+            ] = OrderedDict()
+        else:
+            self.asr_feature_cache_size = 0
+            self.asr_feature_cache = OrderedDict()
 
         # Store states
         self.no_create_loop = False
@@ -234,19 +258,20 @@ class TokenizerManager:
         self.current_load_lock = asyncio.Lock()
 
         # Communicators
+        scheduler_fan_out = max(int(os.environ.get("SGLANG_SCHEDULER_FAN_OUT", "1")), 1)
         self.release_memory_occupation_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, scheduler_fan_out
         )
         self.resume_memory_occupation_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, scheduler_fan_out
         )
-        self.flush_cache_communicator = _Communicator(self.send_to_scheduler, server_args.dp_size)
-        self.profile_communicator = _Communicator(self.send_to_scheduler, server_args.dp_size)
+        self.flush_cache_communicator = _Communicator(self.send_to_scheduler, scheduler_fan_out)
+        self.profile_communicator = _Communicator(self.send_to_scheduler, scheduler_fan_out)
         self.get_internal_state_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, scheduler_fan_out
         )
         self.set_internal_state_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, scheduler_fan_out
         )
 
         # LoRA
@@ -338,6 +363,20 @@ class TokenizerManager:
     ):
         """Tokenize one request."""
 
+        perf_enabled = PERF_TOKENIZE and (
+            PERF_LOG_EVERY <= 1
+            or (
+                isinstance(getattr(obj, "rid", None), str)
+                and (hash(obj.rid) % PERF_LOG_EVERY == 0)
+            )
+        )
+        perf_t0 = time.perf_counter() if perf_enabled else 0.0
+        perf = {} if perf_enabled else None
+
+        def _pmark(name: str, t0: float) -> None:
+            if perf_enabled:
+                perf[name] = time.perf_counter() - t0
+
         # Tokenize
         input_text = obj.text
         input_ids = obj.input_ids
@@ -346,13 +385,19 @@ class TokenizerManager:
                 raise ValueError(
                     "Tokenizer is not initialized but input_text requires tokenization"
                 )
+            t = time.perf_counter() if perf_enabled else 0.0
             encoded = self.tokenizer(input_text)
+            _pmark("text_tokenize_s", t)
             input_ids = encoded["input_ids"]
         audio_features = None
         audio_attention_mask = None
         audio_token_start = None
         audio_token_len = None
+        audio_waveform = None
+        audio_waveform_len = None
+        audio_sampling_rate = None
         if isinstance(obj, GenerateReqInput) and obj.audio_data is not None:
+            t = time.perf_counter() if perf_enabled else 0.0
             (
                 input_ids,
                 audio_features,
@@ -360,12 +405,19 @@ class TokenizerManager:
                 audio_token_start,
                 audio_token_len,
                 audio_hash,
+                audio_waveform,
+                audio_waveform_len,
+                audio_sampling_rate,
             ) = self._process_audio_inputs(obj.audio_data, input_ids)
+            _pmark("audio_process_s", t)
             # Prevent prefix-cache collisions across different audio inputs.
             obj.extra_key = self._merge_asr_audio_extra_key(obj.extra_key, audio_hash)
 
+        t = time.perf_counter() if perf_enabled else 0.0
         self._validate_one_request(obj, input_ids)
-        return self._create_tokenized_object(
+        _pmark("validate_s", t)
+        t = time.perf_counter() if perf_enabled else 0.0
+        tokenized_obj = self._create_tokenized_object(
             obj,
             input_text,
             input_ids,
@@ -373,7 +425,36 @@ class TokenizerManager:
             audio_attention_mask=audio_attention_mask,
             audio_token_start=audio_token_start,
             audio_token_len=audio_token_len,
+            audio_waveform=audio_waveform,
+            audio_waveform_len=audio_waveform_len,
+            audio_sampling_rate=audio_sampling_rate,
         )
+        _pmark("create_tokenized_obj_s", t)
+
+        if perf_enabled:
+            total_s = time.perf_counter() - perf_t0
+            max_stage = ("", 0.0)
+            if perf:
+                max_stage = max(perf.items(), key=lambda kv: kv[1])
+            if PERF_SLOW_MS <= 0 or (total_s * 1000.0) >= PERF_SLOW_MS:
+                breakdown = ", ".join(
+                    f"{k}={v:.4f}s" for k, v in sorted(perf.items(), key=lambda kv: -kv[1])
+                )
+                logger.info(
+                    "[PERF][tokenizer] rid=%s text_tok=%s audio=%s wave_len=%s sr=%s audio_tok_len=%s total=%.4fs max=%s=%.4fs breakdown={%s}",
+                    getattr(obj, "rid", None),
+                    (len(input_ids) if input_ids is not None else None),
+                    (obj.audio_data is not None if isinstance(obj, GenerateReqInput) else None),
+                    audio_waveform_len,
+                    audio_sampling_rate,
+                    audio_token_len,
+                    total_s,
+                    max_stage[0],
+                    max_stage[1],
+                    breakdown,
+                )
+
+        return tokenized_obj
 
     def _validate_one_request(
         self, obj: GenerateReqInput | EmbeddingReqInput, input_ids: list[int]
@@ -434,7 +515,7 @@ class TokenizerManager:
             return extra_key
         return f"{extra_key}|{audio_key}"
 
-    def _decode_audio_base64(self, audio_data: str) -> tuple[np.ndarray, str]:
+    def _decode_audio_base64_bytes(self, audio_data: str) -> tuple[bytes, str]:
         if self.audio_sampling_rate is None:
             raise ValueError("Audio feature extractor is not initialized.")
         if audio_data.startswith("data:"):
@@ -448,31 +529,53 @@ class TokenizerManager:
         raw = base64.b64decode(b64)
         # Used to isolate prefix KV cache across different audio inputs.
         audio_hash = hashlib.sha1(raw).hexdigest()
+        return raw, audio_hash
+
+    def _asr_max_orig_samples(self, orig_sr: int) -> int:
+        if self.audio_sampling_rate is None or self.audio_max_samples is None:
+            raise ValueError("Audio feature extractor is not initialized.")
+        # Truncate on the original sampling rate side to bound payload size.
+        return int(math.ceil(self.audio_max_samples * float(orig_sr) / float(self.audio_sampling_rate)))
+
+    def _asr_resampled_length(self, num_samples: int, orig_sr: int) -> int:
+        if self.audio_sampling_rate is None or self.audio_max_samples is None:
+            raise ValueError("Audio feature extractor is not initialized.")
+        if num_samples <= 0:
+            return 0
+        resampled = int(round(num_samples * float(self.audio_sampling_rate) / float(orig_sr)))
+        return int(min(max(resampled, 0), int(self.audio_max_samples)))
+
+    def _asr_num_frames(self, resampled_len: int) -> int:
+        hop = int(self.audio_hop_length or 160)
+        if hop <= 0:
+            hop = 160
+        return int(max(resampled_len, 0) // hop)
+
+    def _decode_audio_bytes(self, raw: bytes) -> tuple[np.ndarray, int]:
         audio, sr = sf.read(BytesIO(raw), dtype="float32")
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
-        if int(sr) != int(self.audio_sampling_rate):
-            if librosa is not None:
-                try:
-                    audio = librosa.resample(
-                        audio, orig_sr=sr, target_sr=self.audio_sampling_rate
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "librosa resample failed (%s); falling back to linear resample.",
-                        e,
-                    )
-                    audio = _linear_resample(audio, int(sr), int(self.audio_sampling_rate))
-            else:
-                audio = _linear_resample(audio, int(sr), int(self.audio_sampling_rate))
-        return np.asarray(audio, dtype=np.float32), audio_hash
+        return np.asarray(audio, dtype=np.float32), int(sr)
 
     def _extract_audio_features(
         self, audio_data: str
     ) -> tuple[np.ndarray, np.ndarray, int, str]:
         if self.feature_extractor is None:
             raise ValueError("Audio feature extractor is not initialized.")
-        audio, audio_hash = self._decode_audio_base64(audio_data)
+
+        raw, audio_hash = self._decode_audio_base64_bytes(audio_data)
+
+        if self.asr_feature_cache_size > 0:
+            cached = self.asr_feature_cache.get(audio_hash)
+            if cached is not None:
+                self.asr_feature_cache.move_to_end(audio_hash)
+                input_features, attention_mask, audio_token_len = cached
+                return input_features, attention_mask, audio_token_len, audio_hash
+
+        audio, sr = self._decode_audio_bytes(raw)
+        if int(sr) != int(self.audio_sampling_rate):
+            audio = _linear_resample(audio, int(sr), int(self.audio_sampling_rate))
+
         inputs = self.feature_extractor(
             audio,
             sampling_rate=self.audio_sampling_rate,
@@ -484,7 +587,35 @@ class TokenizerManager:
         audio_token_len = self._feat_extract_output_length(int(attention_mask.sum()))
         if audio_token_len <= 0:
             raise ValueError("Invalid audio token length derived from features.")
+
+        if self.asr_feature_cache_size > 0:
+            # LRU insert/evict
+            self.asr_feature_cache[audio_hash] = (input_features, attention_mask, audio_token_len)
+            self.asr_feature_cache.move_to_end(audio_hash)
+            while len(self.asr_feature_cache) > self.asr_feature_cache_size:
+                self.asr_feature_cache.popitem(last=False)
+
         return input_features, attention_mask, audio_token_len, audio_hash
+
+    def _extract_audio_waveform(
+        self, audio_data: str
+    ) -> tuple[np.ndarray, int, int, str]:
+        raw, audio_hash = self._decode_audio_base64_bytes(audio_data)
+        audio, sr = self._decode_audio_bytes(raw)
+        max_orig = self._asr_max_orig_samples(int(sr))
+        if audio.shape[0] > max_orig:
+            audio = audio[:max_orig]
+        # Resample on CPU to reduce host->TPU transfer size. Feature extraction is still on TPU.
+        if int(sr) != int(self.audio_sampling_rate):
+            audio = _linear_resample(audio, int(sr), int(self.audio_sampling_rate))
+            sr = int(self.audio_sampling_rate)
+        if self.audio_max_samples is not None and audio.shape[0] > int(self.audio_max_samples):
+            audio = audio[: int(self.audio_max_samples)]
+        frames = self._asr_num_frames(int(audio.shape[0]))
+        audio_token_len = self._feat_extract_output_length(frames)
+        if audio_token_len <= 0:
+            raise ValueError("Invalid audio token length derived from waveform length.")
+        return audio, int(sr), int(audio_token_len), audio_hash
 
     def _expand_audio_tokens(
         self, input_ids: list[int], audio_token_len: int
@@ -526,7 +657,17 @@ class TokenizerManager:
 
     def _process_audio_inputs(
         self, audio_data: list[str] | str, input_ids: list[int]
-    ) -> tuple[list[int], np.ndarray, np.ndarray, int, int, str]:
+    ) -> tuple[
+        list[int],
+        np.ndarray | None,
+        np.ndarray | None,
+        int,
+        int,
+        str,
+        np.ndarray | None,
+        int | None,
+        int | None,
+    ]:
         if input_ids is None:
             raise ValueError("Audio inputs require input_ids to be present.")
         if isinstance(audio_data, list):
@@ -534,9 +675,21 @@ class TokenizerManager:
                 raise ValueError("Only one audio input is supported per request.")
             audio_data = audio_data[0]
 
-        input_features, attention_mask, audio_token_len, audio_hash = self._extract_audio_features(
-            audio_data
-        )
+        audio_waveform = None
+        audio_waveform_len = None
+        audio_sampling_rate = None
+
+        if self.asr_use_model_feature_extractor:
+            audio_waveform, audio_sampling_rate, audio_token_len, audio_hash = (
+                self._extract_audio_waveform(audio_data)
+            )
+            audio_waveform_len = int(audio_waveform.shape[0])
+            input_features = None
+            attention_mask = None
+        else:
+            input_features, attention_mask, audio_token_len, audio_hash = self._extract_audio_features(
+                audio_data
+            )
         input_ids, audio_token_start = self._expand_audio_tokens(input_ids, audio_token_len)
         return (
             input_ids,
@@ -545,6 +698,9 @@ class TokenizerManager:
             audio_token_start,
             audio_token_len,
             audio_hash,
+            audio_waveform,
+            audio_waveform_len,
+            audio_sampling_rate,
         )
 
     def _create_tokenized_object(
@@ -557,6 +713,9 @@ class TokenizerManager:
         audio_attention_mask: np.ndarray | None = None,
         audio_token_start: int | None = None,
         audio_token_len: int | None = None,
+        audio_waveform: np.ndarray | None = None,
+        audio_waveform_len: int | None = None,
+        audio_sampling_rate: int | None = None,
     ) -> TokenizedGenerateReqInput:
         """Create a tokenized request object from common parameters."""
         # Parse sampling parameters
@@ -590,6 +749,9 @@ class TokenizerManager:
             audio_attention_mask=audio_attention_mask,
             audio_token_start=audio_token_start,
             audio_token_len=audio_token_len,
+            audio_waveform=audio_waveform,
+            audio_waveform_len=audio_waveform_len,
+            audio_sampling_rate=audio_sampling_rate,
         )
         # note: When only `return_logprob` is specified, we assume that only the output probability is required.
         if (

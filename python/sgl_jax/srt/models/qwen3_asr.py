@@ -6,6 +6,7 @@ from typing import Any, Mapping, Optional
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from transformers.audio_utils import mel_filter_bank, window_function
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -33,6 +34,119 @@ def _feat_extract_output_lengths(input_lengths: jax.Array) -> jax.Array:
     feat_lengths = (input_lengths_leave - 1) // 2 + 1
     output_lengths = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
     return output_lengths.astype(jnp.int32)
+
+
+class WhisperLogMelFeatureExtractor(nnx.Module):
+    """A minimal Whisper-style log-mel extractor implemented in JAX.
+
+    This is used by Qwen3-ASR to move feature extraction onto TPU. It matches the
+    HuggingFace WhisperFeatureExtractor preprocessing:
+      - STFT with hann window, center=True (reflect padding), power=2
+      - Apply Slaney mel filter bank
+      - log10 + dynamic range compression (max - 8) and normalization ((x + 4) / 4)
+      - Drop the last STFT frame to get floor(L / hop_length) frames
+    """
+
+    def __init__(
+        self,
+        *,
+        num_mel_bins: int,
+        sampling_rate: int = 16000,
+        hop_length: int = 160,
+        n_fft: int = 400,
+        mel_floor: float = 1e-10,
+    ):
+        self.num_mel_bins = int(num_mel_bins)
+        self.sampling_rate = int(sampling_rate)
+        self.hop_length = int(hop_length)
+        self.n_fft = int(n_fft)
+        self.mel_floor = float(mel_floor)
+
+        mel = mel_filter_bank(
+            num_frequency_bins=1 + self.n_fft // 2,
+            num_mel_filters=self.num_mel_bins,
+            min_frequency=0.0,
+            max_frequency=float(self.sampling_rate) / 2.0,
+            sampling_rate=self.sampling_rate,
+            norm="slaney",
+            mel_scale="slaney",
+        )
+        win = window_function(self.n_fft, "hann")
+        self.mel_filters = nnx.Cache(jnp.asarray(mel, dtype=jnp.float32))
+        self.window = nnx.Cache(jnp.asarray(win, dtype=jnp.float32))
+
+    def materialize(self) -> None:
+        # Similar to SinusoidsPositionEmbedding: after eval_shape, caches may hold ShapeDtypeStruct.
+        for attr in ("mel_filters", "window"):
+            cached = getattr(self, attr).value
+            if isinstance(cached, jax.ShapeDtypeStruct):
+                if attr == "mel_filters":
+                    mel = mel_filter_bank(
+                        num_frequency_bins=1 + self.n_fft // 2,
+                        num_mel_filters=self.num_mel_bins,
+                        min_frequency=0.0,
+                        max_frequency=float(self.sampling_rate) / 2.0,
+                        sampling_rate=self.sampling_rate,
+                        norm="slaney",
+                        mel_scale="slaney",
+                    )
+                    setattr(self, attr, nnx.Cache(jnp.asarray(mel, dtype=jnp.float32)))
+                else:
+                    win = window_function(self.n_fft, "hann")
+                    setattr(self, attr, nnx.Cache(jnp.asarray(win, dtype=jnp.float32)))
+
+    def __call__(
+        self, waveforms: jax.Array, *, waveform_lens: jax.Array | None = None
+    ) -> tuple[jax.Array, jax.Array]:
+        # waveforms: [B, T] float32 at 16kHz
+        bsz, wav_len = waveforms.shape
+        hop = self.hop_length
+        n_fft = self.n_fft
+        pad = n_fft // 2
+
+        if waveform_lens is None:
+            waveform_lens = jnp.full((bsz,), wav_len, dtype=jnp.int32)
+        else:
+            waveform_lens = waveform_lens.astype(jnp.int32)
+
+        # Center padding (reflect) matches torch.stft(center=True, pad_mode="reflect").
+        waveforms = jnp.pad(waveforms.astype(jnp.float32), ((0, 0), (pad, pad)), mode="reflect")
+
+        # STFT frame count before dropping the last frame: 1 + floor(L / hop_length)
+        num_frames = 1 + (wav_len // hop)
+        frame_starts = jnp.arange(num_frames, dtype=jnp.int32) * hop
+        frame_idx = frame_starts[:, None] + jnp.arange(n_fft, dtype=jnp.int32)[None, :]
+
+        # Gather frames for all batch elements: [B, num_frames, n_fft]
+        frames = jnp.take(waveforms, frame_idx, axis=1)
+        window = self.window.value
+        frames = frames * window[None, None, :]
+
+        stft = jnp.fft.rfft(frames, n=n_fft)
+        power_spec = (stft.real.astype(jnp.float32) ** 2) + (stft.imag.astype(jnp.float32) ** 2)
+
+        # Drop the last time frame to match WhisperFeatureExtractor behaviour.
+        power_spec = power_spec[:, :-1, :]
+
+        mel_filters = self.mel_filters.value  # [freq_bins, n_mels]
+        mel_spec = jnp.einsum("btf,fm->btm", power_spec, mel_filters)
+        mel_spec = jnp.maximum(mel_spec, jnp.asarray(self.mel_floor, dtype=mel_spec.dtype))
+
+        log_spec = jnp.log10(mel_spec)
+        max_val = jnp.max(log_spec, axis=(1, 2), keepdims=True)
+        log_spec = jnp.maximum(log_spec, max_val - 8.0)
+        log_spec = (log_spec + 4.0) / 4.0
+
+        # [B, T, M] -> [B, M, T]
+        features = log_spec.transpose(0, 2, 1)
+
+        # Attention mask on feature frames: floor(waveform_len / hop_length)
+        feat_len = wav_len // hop
+        valid_frames = (waveform_lens // hop).astype(jnp.int32)
+        t = jnp.arange(feat_len, dtype=jnp.int32)[None, :]
+        attention_mask = (t < valid_frames[:, None]).astype(jnp.int32)
+
+        return features, attention_mask
 
 
 @dataclass(frozen=True)
@@ -453,6 +567,12 @@ class Qwen3ASRForConditionalGeneration(nnx.Module):
         self.audio_token_id = int(asr_cfg.thinker_config.audio_token_id)
 
         self.audio_tower = Qwen3ASRAudioEncoder(asr_cfg.thinker_config.audio_config, rngs=nnx.Rngs(0))
+        self.audio_feature_extractor = WhisperLogMelFeatureExtractor(
+            num_mel_bins=int(asr_cfg.thinker_config.audio_config.num_mel_bins),
+            sampling_rate=16000,
+            hop_length=160,
+            n_fft=400,
+        )
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
@@ -519,6 +639,10 @@ class Qwen3ASRForConditionalGeneration(nnx.Module):
         # Ensure positional embedding cache is materialized after eval_shape.
         try:
             self.audio_tower.positional_embedding.materialize()
+        except Exception:
+            pass
+        try:
+            self.audio_feature_extractor.materialize()
         except Exception:
             pass
         logger.info("Qwen3-ASR weights loaded successfully!")
@@ -785,13 +909,22 @@ class Qwen3ASRForConditionalGeneration(nnx.Module):
     ):
         hidden_states = self.embed_tokens(forward_batch.input_ids)
 
-        if forward_batch.audio_features is not None and forward_batch.forward_mode.is_extend():
-            audio_embeds, _ = self.audio_tower(
-                forward_batch.audio_features,
-                feature_attention_mask=forward_batch.audio_attention_mask,
-            )
-            audio_embeds = audio_embeds.astype(hidden_states.dtype)
-            hidden_states = self._merge_audio(hidden_states, forward_batch, audio_embeds)
+        if forward_batch.forward_mode.is_extend():
+            audio_features = forward_batch.audio_features
+            audio_attention_mask = forward_batch.audio_attention_mask
+            if audio_features is None and forward_batch.audio_waveforms is not None:
+                audio_features, audio_attention_mask = self.audio_feature_extractor(
+                    forward_batch.audio_waveforms,
+                    waveform_lens=forward_batch.audio_waveform_lens,
+                )
+
+            if audio_features is not None:
+                audio_embeds, _ = self.audio_tower(
+                    audio_features,
+                    feature_attention_mask=audio_attention_mask,
+                )
+                audio_embeds = audio_embeds.astype(hidden_states.dtype)
+                hidden_states = self._merge_audio(hidden_states, forward_batch, audio_embeds)
 
         hidden_states, aux_hidden_states, layers_kv_fused, layers_callback_flag = self.model(
             forward_batch, token_to_kv_pool, hidden_states

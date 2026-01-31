@@ -562,25 +562,24 @@ def _launch_subprocesses(
         server_args.model_path, server_args.tokenizer_path
     )
 
+    # NOTE: dp_size currently controls JAX mesh/data-parallelism inside a single scheduler process.
+    # Multi-scheduler data-parallel serving is not implemented in this repo yet.
     scheduler_procs = []
-    if server_args.dp_size == 1:
-        scheduler_pipe_readers = []
-        reader, writer = mp.Pipe(duplex=False)
-        proc = mp.Process(
-            target=run_scheduler_process,
-            args=(
-                server_args,
-                port_args,
-                None,
-                writer,
-            ),
-        )
-        # with memory_saver_adapter.configure_subprocess():
-        proc.start()
-        scheduler_procs.append(proc)
-        scheduler_pipe_readers.append(reader)
-    else:
-        pass
+    scheduler_pipe_readers = []
+    reader, writer = mp.Pipe(duplex=False)
+    proc = mp.Process(
+        target=run_scheduler_process,
+        args=(
+            server_args,
+            port_args,
+            None,
+            writer,
+        ),
+    )
+    # with memory_saver_adapter.configure_subprocess():
+    proc.start()
+    scheduler_procs.append(proc)
+    scheduler_pipe_readers.append(reader)
 
     if server_args.node_rank >= 1:
         # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
@@ -667,13 +666,10 @@ def _launch_threads(
     )
 
     scheduler_threads = []
+    scheduler_pipe_readers = []
     scheduler_infos = []
-    if server_args.dp_size == 1:
-        scheduler_pipe_readers = []
-        scheduler_info = run_scheduler_loop_thread_after_create(server_args, port_args)
-        scheduler_infos.append(scheduler_info)
-    else:
-        pass
+    scheduler_info = run_scheduler_loop_thread_after_create(server_args, port_args)
+    scheduler_infos.append(scheduler_info)
 
     if server_args.node_rank >= 1:
         # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,

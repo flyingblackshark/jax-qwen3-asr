@@ -105,6 +105,7 @@ payload = {
         {
             "role": "user",
             "content": [
+                {"type": "text", "text": "<|audio_pad|>"},
                 {
                     "type": "audio_url",
                     "audio_url": {"url": "data:audio/mp3;base64," + audio_b64},
@@ -121,7 +122,7 @@ pathlib.Path(os.environ.get("REQ_PATH", "/tmp/asr_request.json")).write_text(
 )
 PY
 
-http_code=$(curl -s --max-time 120 -o "${RESP_PATH}" -w "%{http_code}" \
+http_code=$(curl -s --max-time 600 -o "${RESP_PATH}" -w "%{http_code}" \
   -H "Content-Type: application/json" \
   -d @"${REQ_PATH}" \
   "http://127.0.0.1:${PORT}/v1/chat/completions" || true)

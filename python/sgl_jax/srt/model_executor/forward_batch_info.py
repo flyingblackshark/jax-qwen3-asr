@@ -182,6 +182,9 @@ class ForwardBatch:
     audio_attention_mask: jax.Array | None = None
     audio_token_start: jax.Array | None = None
     audio_token_len: jax.Array | None = None
+    audio_waveforms: jax.Array | None = None
+    audio_waveform_lens: jax.Array | None = None
+    audio_sampling_rates: jax.Array | None = None
 
     def tree_flatten(self):
         children = (
@@ -204,6 +207,9 @@ class ForwardBatch:
             self.audio_attention_mask,
             self.audio_token_start,
             self.audio_token_len,
+            self.audio_waveforms,
+            self.audio_waveform_lens,
+            self.audio_sampling_rates,
         )
 
         aux_data = {
@@ -253,11 +259,22 @@ class ForwardBatch:
             obj.audio_attention_mask = children[16]
             obj.audio_token_start = children[17]
             obj.audio_token_len = children[18]
+            if len(children) > 19:
+                obj.audio_waveforms = children[19]
+                obj.audio_waveform_lens = children[20]
+                obj.audio_sampling_rates = children[21]
+            else:
+                obj.audio_waveforms = None
+                obj.audio_waveform_lens = None
+                obj.audio_sampling_rates = None
         else:
             obj.audio_features = None
             obj.audio_attention_mask = None
             obj.audio_token_start = None
             obj.audio_token_len = None
+            obj.audio_waveforms = None
+            obj.audio_waveform_lens = None
+            obj.audio_sampling_rates = None
 
         return obj
 
@@ -344,32 +361,43 @@ class ForwardBatch:
                 batch.lora_ranks,
             )
 
+        audio_features = None
+        audio_attention_mask = None
+        audio_token_start = None
+        audio_token_len = None
+        audio_waveforms = None
+        audio_waveform_lens = None
+        audio_sampling_rates = None
+
         if batch.audio_features is not None:
-            (
-                audio_features,
-                audio_attention_mask,
-                audio_token_start,
-                audio_token_len,
-            ) = device_array(
-                (
-                    batch.audio_features,
-                    batch.audio_attention_mask,
-                    batch.audio_token_start,
-                    batch.audio_token_len,
-                ),
+            (audio_features, audio_attention_mask) = device_array(
+                (batch.audio_features, batch.audio_attention_mask),
                 sharding=(
                     NamedSharding(model_runner.mesh, PartitionSpec())
                     if jax.process_count() == 1
                     else None
                 ),
             )
-        else:
-            (
-                audio_features,
-                audio_attention_mask,
-                audio_token_start,
-                audio_token_len,
-            ) = (None, None, None, None)
+
+        if batch.audio_token_start is not None:
+            (audio_token_start, audio_token_len) = device_array(
+                (batch.audio_token_start, batch.audio_token_len),
+                sharding=(
+                    NamedSharding(model_runner.mesh, PartitionSpec())
+                    if jax.process_count() == 1
+                    else None
+                ),
+            )
+
+        if batch.audio_waveforms is not None:
+            (audio_waveforms, audio_waveform_lens, audio_sampling_rates) = device_array(
+                (batch.audio_waveforms, batch.audio_waveform_lens, batch.audio_sampling_rates),
+                sharding=(
+                    NamedSharding(model_runner.mesh, PartitionSpec())
+                    if jax.process_count() == 1
+                    else None
+                ),
+            )
 
         obj = cls(
             bid=batch.bid,
@@ -396,6 +424,9 @@ class ForwardBatch:
             audio_attention_mask=audio_attention_mask,
             audio_token_start=audio_token_start,
             audio_token_len=audio_token_len,
+            audio_waveforms=audio_waveforms,
+            audio_waveform_lens=audio_waveform_lens,
+            audio_sampling_rates=audio_sampling_rates,
         )
 
         # Auto-generate attention mask for Encoder-only models (e.g. UMT5Encoder, BERT)

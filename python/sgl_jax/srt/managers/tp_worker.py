@@ -23,6 +23,8 @@ from sgl_jax.srt.layers.routed_experts_capturer import get_global_experts_captur
 from sgl_jax.srt.managers.schedule_batch import (
     ModelWorkerBatch,
     global_server_args_dict,
+    _ASR_AUDIO_FRAME_PADDINGS,
+    _ASR_AUDIO_HOP_LENGTH,
 )
 from sgl_jax.srt.managers.utils import resolve_future_token_ids, set_future_token_ids
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -37,10 +39,25 @@ from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils.common_utils import (
     PRECOMPILE_DEFAULT_BS_PADDINGS,
     PRECOMPILE_DEFAULT_TOKEN_PADDINGS,
+    get_bool_env_var,
 )
 from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+PERF_BREAKDOWN = get_bool_env_var("SGLANG_PERF_BREAKDOWN")
+PERF_BLOCK_UNTIL_READY = get_bool_env_var("SGLANG_PERF_BLOCK_UNTIL_READY")
+PERF_LOG_EVERY = int(os.environ.get("SGLANG_PERF_LOG_EVERY", "1") or "1")
+PERF_SLOW_MS = float(os.environ.get("SGLANG_PERF_SLOW_MS", "0") or "0")
+
+
+def _asr_feat_extract_output_length(input_frames: int) -> int:
+    """Match TokenizerManager._feat_extract_output_length (for warmup token lengths)."""
+    input_len = int(input_frames)
+    input_lengths_leave = input_len % 100
+    feat_lengths = (input_lengths_leave - 1) // 2 + 1
+    output_lengths = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_len // 100) * 13
+    return int(output_lengths)
 
 
 class ModelWorker:
@@ -241,6 +258,7 @@ class ModelWorker:
 
     def run_precompile(self, future_token_ids_map=None):
         self.precompile_extend(future_token_ids_map)
+        self.precompile_asr_audio(future_token_ids_map)
         self.precompile_decode(future_token_ids_map)
 
     def precompile_extend(self, future_token_ids_map=None):
@@ -290,6 +308,97 @@ class ModelWorker:
                 self.forward_batch_generation(model_worker_batch, None, False, sampling_metadata)
         end_time = time.perf_counter()
         logger.info("[EXTEND] Precompile finished in %.0f secs", end_time - start_time)
+
+    def precompile_asr_audio(self, future_token_ids_map=None):
+        """Precompile ASR audio path (Whisper log-mel + audio tower) if enabled.
+
+        This avoids first-request compilation latency when using model-side feature extraction.
+        """
+        if not getattr(self.server_args, "asr_warmup_audio", False):
+            return
+
+        token_paddings = getattr(self.server_args, "asr_warmup_audio_token_paddings", None)
+        if not token_paddings:
+            # Default is a single, common bucket for the ASR prompt.
+            token_paddings = [256]
+        token_paddings = sorted(set(int(x) for x in token_paddings if int(x) > 0))
+
+        frame_paddings = getattr(self.server_args, "asr_warmup_audio_frame_paddings", None)
+        if not frame_paddings:
+            # Match runtime bucketing by default.
+            frame_paddings = list(_ASR_AUDIO_FRAME_PADDINGS)
+        frame_paddings = sorted(set(int(x) for x in frame_paddings if int(x) > 0))
+
+        hop = max(int(_ASR_AUDIO_HOP_LENGTH), 1)
+
+        bs, _ = self.get_max_padded_size()
+        start_time = time.perf_counter()
+        logger.info(
+            "[ASR_WARMUP] Begin to precompile audio path. bs=%d token_paddings=%s frame_paddings=%s",
+            bs,
+            token_paddings,
+            frame_paddings,
+        )
+
+        pairs = list(itertools.product(token_paddings, frame_paddings))
+        with tqdm(pairs, desc="[ASR_WARMUP] PRECOMPILE", leave=False) as pbar:
+            for num_tokens, frames in pbar:
+                pbar.set_postfix(tokens=num_tokens, frames=frames)
+                if bs > num_tokens:
+                    logger.warning(
+                        "[ASR_WARMUP] bs=%s > num_tokens=%s, skip this pair", bs, num_tokens
+                    )
+                    continue
+
+                audio_samples = int(frames * hop)
+                # Keep a minimum length to avoid invalid reflect padding on very short clips.
+                audio_samples = max(audio_samples, 400)
+
+                model_worker_batch = self.generate_model_worker_batch(
+                    bs,
+                    int(num_tokens),
+                    ForwardMode.EXTEND,
+                    self.precompile_cache_loc_paddings[-1],
+                    enable_static_lora=self.server_args.enable_static_lora,
+                )
+
+                # Provide dummy waveforms so model-side feature extraction executes.
+                model_worker_batch.audio_waveforms = np.zeros(
+                    (bs, audio_samples), dtype=np.float32
+                )
+                model_worker_batch.audio_waveform_lens = np.full(
+                    (bs,), audio_samples, dtype=np.int32
+                )
+                model_worker_batch.audio_sampling_rates = np.full(
+                    (bs,), 16000, dtype=np.int32
+                )
+                model_worker_batch.audio_token_start = np.zeros((bs,), dtype=np.int32)
+                model_worker_batch.audio_token_len = np.full(
+                    (bs,),
+                    max(_asr_feat_extract_output_length(int(frames)), 1),
+                    dtype=np.int32,
+                )
+
+                sampling_metadata = SamplingMetadata.from_model_worker_batch(
+                    model_worker_batch,
+                    0,
+                    self.mesh,
+                    self.model_config.vocab_size,
+                )
+                model_worker_batch.forward_batch = ForwardBatch.init_new(
+                    model_worker_batch, self.model_runner
+                )
+                if future_token_ids_map is not None:
+                    model_worker_batch.forward_batch.input_ids = resolve_future_token_ids(
+                        model_worker_batch.forward_batch.input_ids,
+                        future_token_ids_map,
+                    )
+
+                # Only compile/execute the forward; sampling is already covered by the normal precompile.
+                self.forward_batch_generation(model_worker_batch, None, True, sampling_metadata)
+
+        end_time = time.perf_counter()
+        logger.info("[ASR_WARMUP] Precompile finished in %.0f secs", end_time - start_time)
 
     def precompile_decode(self, future_token_ids_map=None):
         start_time = time.perf_counter()
@@ -501,34 +610,68 @@ class ModelWorker:
         sampling_metadata: SamplingMetadata = None,
         forward_metadata=None,
     ) -> tuple[LogitsProcessorOutput | jax.Array | int, jax.Array | None]:
+        perf_enabled = PERF_BREAKDOWN and (
+            PERF_LOG_EVERY <= 1 or (model_worker_batch.bid % PERF_LOG_EVERY == 0)
+        )
+        perf_t0 = time.perf_counter() if perf_enabled else 0.0
+        perf = {} if perf_enabled else None
+
+        def _pmark(name: str, t0: float) -> None:
+            if perf_enabled:
+                perf[name] = time.perf_counter() - t0
+
+        def _block_until_ready(x) -> None:
+            if not PERF_BLOCK_UNTIL_READY:
+                return
+            if x is None:
+                return
+            try:
+                x.block_until_ready()
+            except Exception:
+                return
+
         # Prepare LoRA batch if LoRA is enabled
         if self.worker.server_args.enable_lora and self.need_prepare_lora_batch:
+            t = time.perf_counter() if perf_enabled else 0.0
             self.prepare_lora_batch(model_worker_batch)
+            _pmark("lora_prepare_s", t)
 
         # Use pre-initialized ForwardBatch if available (for overlap scheduling optimization)
         if model_worker_batch.forward_batch is not None:
             forward_batch = model_worker_batch.forward_batch
         else:
+            t = time.perf_counter() if perf_enabled else 0.0
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            _pmark("forward_batch_init_s", t)
 
         if forward_metadata is None:
+            t = time.perf_counter() if perf_enabled else 0.0
             forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
                 model_worker_batch
             )
+            _pmark("forward_metadata_s", t)
 
         if sampling_metadata is None:
+            t = time.perf_counter() if perf_enabled else 0.0
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
                 model_worker_batch,
                 len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
                 self.mesh,
                 self.model_config.vocab_size,
             )
+            _pmark("sampling_metadata_s", t)
 
         self.model_runner.attn_backend.forward_metadata = forward_metadata
+        t_forward = time.perf_counter() if perf_enabled else 0.0
         logits_output, cache_miss_count, layers_topk_ids = self.model_runner.forward(
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
         )
+        _pmark("model_forward_dispatch_s", t_forward)
+        if perf_enabled:
+            t = time.perf_counter()
+            _block_until_ready(getattr(logits_output, "next_token_logits", None))
+            _pmark("model_forward_block_s", t)
 
         self.dump_topk_ids(layers_topk_ids, model_worker_batch)
 
@@ -562,14 +705,22 @@ class ModelWorker:
                 self._update_grammar_vocab_mask(model_worker_batch, sampling_metadata)
 
             with jtu.count_pjit_cpp_cache_miss() as count:
+                t_sample = time.perf_counter() if perf_enabled else 0.0
                 next_token_ids_device, token_logprobs, new_logits_output = self.model_runner.sample(
                     logits_output,
                     sampling_metadata,
                 )
+                _pmark("sample_dispatch_s", t_sample)
+                if perf_enabled:
+                    t = time.perf_counter()
+                    _block_until_ready(next_token_ids_device)
+                    _pmark("sample_block_s", t)
                 cache_miss_count += count()
             if model_worker_batch.return_output_logprob_only:
+                t_logprob = time.perf_counter() if perf_enabled else 0.0
                 logprobs = self.model_runner.compute_logprobs(token_logprobs, next_token_ids_device)
                 logits_output.next_token_logprobs = logprobs[: model_worker_batch.real_bs]
+                _pmark("compute_logprobs_s", t_logprob)
         if new_logits_output is not None:
             logits_output = new_logits_output
             if logits_output.next_token_top_logprobs_val is not None:
@@ -598,6 +749,45 @@ class ModelWorker:
                     jnp.float32
                 ).tolist()
                 logits_output.input_top_logprobs_idx = logits_output.input_top_logprobs_idx.tolist()
+
+        if perf_enabled:
+            total_s = time.perf_counter() - perf_t0
+            max_stage = ("", 0.0)
+            if perf:
+                max_stage = max(perf.items(), key=lambda kv: kv[1])
+
+            def _shape(x):
+                try:
+                    return tuple(x.shape)
+                except Exception:
+                    return None
+
+            audio_shape = _shape(getattr(forward_batch, "audio_waveforms", None))
+            feat_shape = _shape(getattr(forward_batch, "audio_features", None))
+            tok_shape = _shape(getattr(forward_batch, "input_ids", None))
+            bs = int(getattr(model_worker_batch, "real_bs", 0) or 0)
+            mode = getattr(model_worker_batch, "forward_mode", None)
+            mode_str = str(mode) if mode is not None else "?"
+
+            if PERF_SLOW_MS <= 0 or (total_s * 1000.0) >= PERF_SLOW_MS:
+                # Keep this as a single line so it's easy to grep.
+                breakdown = ", ".join(
+                    f"{k}={v:.4f}s" for k, v in sorted(perf.items(), key=lambda kv: -kv[1])
+                )
+                logger.info(
+                    "[PERF][worker] mode=%s bid=%s bs=%d tok=%s audio=%s feat=%s miss=%d total=%.4fs max=%s=%.4fs breakdown={%s}",
+                    mode_str,
+                    getattr(model_worker_batch, "bid", None),
+                    bs,
+                    tok_shape,
+                    audio_shape,
+                    feat_shape,
+                    int(cache_miss_count or 0),
+                    total_s,
+                    max_stage[0],
+                    max_stage[1],
+                    breakdown,
+                )
 
         return (
             logits_output,

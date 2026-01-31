@@ -53,7 +53,7 @@ def main():
     parser.add_argument("--concurrency", type=int, default=40)
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument("--timeout", type=float, default=600.0)
     args = parser.parse_args()
 
     b64, duration = _load_audio_b64(args.audio)
@@ -64,6 +64,7 @@ def main():
             {
                 "role": "user",
                 "content": [
+                    {"type": "text", "text": "<|audio_pad|>"},
                     {
                         "type": "audio_url",
                         "audio_url": {"url": "data:audio/mp3;base64," + b64},

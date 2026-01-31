@@ -19,6 +19,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 import dataclasses
 import logging
+import os
 import threading
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
@@ -57,6 +58,46 @@ if TYPE_CHECKING:
     from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
+
+# ASR waveform padding buckets (16kHz samples). This reduces JIT recompiles for TPU-side
+# Whisper log-mel extraction when audio lengths vary.
+_DEFAULT_ASR_AUDIO_FRAME_PADDINGS = [64, 128, 256, 512, 1024, 2048, 3000]
+
+
+def _parse_int_list_env(name: str, default: list[int]) -> list[int]:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return list(default)
+    out: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            val = int(part)
+        except Exception:
+            continue
+        if val > 0:
+            out.append(val)
+    out = sorted(set(out))
+    return out if out else list(default)
+
+
+_ASR_AUDIO_HOP_LENGTH = int(os.environ.get("SGLANG_ASR_AUDIO_HOP_LENGTH", "160"))
+_ASR_AUDIO_FRAME_PADDINGS = _parse_int_list_env(
+    "SGLANG_ASR_AUDIO_FRAME_PADDINGS", _DEFAULT_ASR_AUDIO_FRAME_PADDINGS
+)
+
+
+def _round_up_asr_audio_samples(num_samples: int) -> int:
+    hop = max(int(_ASR_AUDIO_HOP_LENGTH), 1)
+    if num_samples <= 0:
+        return hop
+    req_frames = (num_samples + hop - 1) // hop
+    for pad_frames in _ASR_AUDIO_FRAME_PADDINGS:
+        if pad_frames >= req_frames:
+            return int(pad_frames * hop)
+    return int(req_frames * hop)
 
 
 GLOBAL_SERVER_ARGS_KEYS = [
@@ -172,6 +213,9 @@ class Req:
         audio_attention_mask: np.ndarray | None = None,
         audio_token_start: int | None = None,
         audio_token_len: int | None = None,
+        audio_waveform: np.ndarray | None = None,
+        audio_waveform_len: int | None = None,
+        audio_sampling_rate: int | None = None,
     ):
         # Input and output info
         self.rid = rid
@@ -196,6 +240,9 @@ class Req:
         self.audio_attention_mask = audio_attention_mask
         self.audio_token_start = audio_token_start
         self.audio_token_len = audio_token_len
+        self.audio_waveform = audio_waveform
+        self.audio_waveform_len = audio_waveform_len
+        self.audio_sampling_rate = audio_sampling_rate
 
         # Extra key for cache namespace isolation (e.g., cache_salt, lora_id)
         if lora_id is not None:
@@ -1330,43 +1377,6 @@ class ScheduleBatch:
                     [extend_logprob_start_lens, invalid_extend_logprob_start_lens], axis=0
                 )
 
-        audio_features = None
-        audio_attention_mask = None
-        audio_token_start = None
-        audio_token_len = None
-        if self.forward_mode.is_extend():
-            has_audio = any(req.audio_features is not None for req in self.reqs)
-            if has_audio:
-                total_bs = len(seq_lens_cpu)
-                max_audio_len = 0
-                feat_dim = None
-                for req in self.reqs:
-                    if req.audio_features is not None:
-                        max_audio_len = max(max_audio_len, req.audio_features.shape[1])
-                        if feat_dim is None:
-                            feat_dim = req.audio_features.shape[0]
-                if max_audio_len > 0 and feat_dim is not None:
-                    audio_features = np.zeros(
-                        (total_bs, feat_dim, max_audio_len), dtype=np.float32
-                    )
-                    audio_attention_mask = np.zeros((total_bs, max_audio_len), dtype=np.int32)
-                    audio_token_start = np.full((total_bs,), -1, dtype=np.int32)
-                    audio_token_len = np.zeros((total_bs,), dtype=np.int32)
-                    for i, req in enumerate(self.reqs):
-                        if req.audio_features is None:
-                            continue
-                        cur_len = req.audio_features.shape[1]
-                        audio_features[i, :, :cur_len] = req.audio_features
-                        audio_attention_mask[i, :cur_len] = req.audio_attention_mask
-                        audio_token_start[i] = int(req.audio_token_start)
-                        audio_token_len[i] = int(req.audio_token_len)
-
-            else:
-                invalid_extend_start_loc = np.array(
-                    [len(seq_lens_cpu)] * bs_padding_size, dtype=extend_start_loc.dtype
-                )
-                extend_start_loc = np.concat([extend_start_loc, invalid_extend_start_loc], axis=0)
-
         sampling_info = self.sampling_info
         if self.sampling_info:
             new_temperatures = np.concatenate(
@@ -1420,34 +1430,74 @@ class ScheduleBatch:
 
         audio_features = None
         audio_attention_mask = None
+        audio_waveforms = None
+        audio_waveform_lens = None
+        audio_sampling_rates = None
         audio_token_start = None
         audio_token_len = None
         if self.forward_mode.is_extend():
-            has_audio = any(req.audio_features is not None for req in self.reqs)
+            has_audio_features = any(req.audio_features is not None for req in self.reqs)
+            has_audio_waveform = any(req.audio_waveform is not None for req in self.reqs)
+            has_audio = has_audio_features or has_audio_waveform
             if has_audio:
                 total_bs = len(seq_lens_cpu)
-                max_audio_len = 0
-                feat_dim = None
-                for req in self.reqs:
-                    if req.audio_features is not None:
-                        max_audio_len = max(max_audio_len, req.audio_features.shape[1])
-                        if feat_dim is None:
-                            feat_dim = req.audio_features.shape[0]
-                if max_audio_len > 0 and feat_dim is not None:
-                    audio_features = np.zeros(
-                        (total_bs, feat_dim, max_audio_len), dtype=np.float32
-                    )
-                    audio_attention_mask = np.zeros((total_bs, max_audio_len), dtype=np.int32)
-                    audio_token_start = np.full((total_bs,), -1, dtype=np.int32)
-                    audio_token_len = np.zeros((total_bs,), dtype=np.int32)
-                    for i, req in enumerate(self.reqs):
-                        if req.audio_features is None:
+
+                # token insertion positions into the flattened prompt
+                audio_token_start = np.full((total_bs,), -1, dtype=np.int32)
+                audio_token_len = np.zeros((total_bs,), dtype=np.int32)
+                for i, req in enumerate(self.reqs):
+                    if req.audio_token_start is None:
+                        continue
+                    audio_token_start[i] = int(req.audio_token_start)
+                    audio_token_len[i] = int(req.audio_token_len or 0)
+
+                if has_audio_waveform:
+                    max_audio_samples = 0
+                    for req in self.reqs:
+                        if req.audio_waveform is None:
                             continue
-                        cur_len = req.audio_features.shape[1]
-                        audio_features[i, :, :cur_len] = req.audio_features
-                        audio_attention_mask[i, :cur_len] = req.audio_attention_mask
-                        audio_token_start[i] = int(req.audio_token_start)
-                        audio_token_len[i] = int(req.audio_token_len)
+                        if req.audio_waveform_len is not None:
+                            max_audio_samples = max(max_audio_samples, int(req.audio_waveform_len))
+                        else:
+                            max_audio_samples = max(max_audio_samples, int(req.audio_waveform.shape[0]))
+                    # Whisper-style feature extraction uses reflect padding of n_fft//2.
+                    # Keep a minimum length to avoid invalid reflect padding on very short clips.
+                    max_audio_samples = max(max_audio_samples, 400)
+                    max_audio_samples = _round_up_asr_audio_samples(max_audio_samples)
+                    if max_audio_samples > 0:
+                        audio_waveforms = np.zeros((total_bs, max_audio_samples), dtype=np.float32)
+                        audio_waveform_lens = np.zeros((total_bs,), dtype=np.int32)
+                        audio_sampling_rates = np.full((total_bs,), 16000, dtype=np.int32)
+                        for i, req in enumerate(self.reqs):
+                            if req.audio_waveform is None:
+                                continue
+                            cur_len = int(
+                                req.audio_waveform_len
+                                if req.audio_waveform_len is not None
+                                else req.audio_waveform.shape[0]
+                            )
+                            audio_waveforms[i, :cur_len] = req.audio_waveform[:cur_len]
+                            audio_waveform_lens[i] = cur_len
+                            if req.audio_sampling_rate is not None and int(req.audio_sampling_rate) > 0:
+                                audio_sampling_rates[i] = int(req.audio_sampling_rate)
+
+                if has_audio_features:
+                    max_audio_len = 0
+                    feat_dim = None
+                    for req in self.reqs:
+                        if req.audio_features is not None:
+                            max_audio_len = max(max_audio_len, req.audio_features.shape[1])
+                            if feat_dim is None:
+                                feat_dim = req.audio_features.shape[0]
+                    if max_audio_len > 0 and feat_dim is not None:
+                        audio_features = np.zeros((total_bs, feat_dim, max_audio_len), dtype=np.float32)
+                        audio_attention_mask = np.zeros((total_bs, max_audio_len), dtype=np.int32)
+                        for i, req in enumerate(self.reqs):
+                            if req.audio_features is None:
+                                continue
+                            cur_len = req.audio_features.shape[1]
+                            audio_features[i, :, :cur_len] = req.audio_features
+                            audio_attention_mask[i, :cur_len] = req.audio_attention_mask
         # Pad lora_ids to match seq_lens_cpu length (after bs padding)
         if bs_padding_size > 0:
             lora_ids = lora_ids + [None] * bs_padding_size
@@ -1488,6 +1538,9 @@ class ScheduleBatch:
             audio_attention_mask=audio_attention_mask,
             audio_token_start=audio_token_start,
             audio_token_len=audio_token_len,
+            audio_waveforms=audio_waveforms,
+            audio_waveform_lens=audio_waveform_lens,
+            audio_sampling_rates=audio_sampling_rates,
         )
 
     def get_spec_model_worker_batch(
@@ -1631,6 +1684,73 @@ class ScheduleBatch:
         # Extract lora_ids from requests
         lora_ids = [req.lora_id for req in self.reqs]
 
+        audio_features = None
+        audio_attention_mask = None
+        audio_waveforms = None
+        audio_waveform_lens = None
+        audio_sampling_rates = None
+        audio_token_start = None
+        audio_token_len = None
+        if self.forward_mode.is_extend():
+            has_audio_features = any(req.audio_features is not None for req in self.reqs)
+            has_audio_waveform = any(req.audio_waveform is not None for req in self.reqs)
+            has_audio = has_audio_features or has_audio_waveform
+            if has_audio:
+                total_bs = len(seq_lens_cpu)
+                audio_token_start = np.full((total_bs,), -1, dtype=np.int32)
+                audio_token_len = np.zeros((total_bs,), dtype=np.int32)
+                for i, req in enumerate(self.reqs):
+                    if req.audio_token_start is None:
+                        continue
+                    audio_token_start[i] = int(req.audio_token_start)
+                    audio_token_len[i] = int(req.audio_token_len or 0)
+
+                if has_audio_waveform:
+                    max_audio_samples = 0
+                    for req in self.reqs:
+                        if req.audio_waveform is None:
+                            continue
+                        if req.audio_waveform_len is not None:
+                            max_audio_samples = max(max_audio_samples, int(req.audio_waveform_len))
+                        else:
+                            max_audio_samples = max(max_audio_samples, int(req.audio_waveform.shape[0]))
+                    max_audio_samples = max(max_audio_samples, 400)
+                    max_audio_samples = _round_up_asr_audio_samples(max_audio_samples)
+                    if max_audio_samples > 0:
+                        audio_waveforms = np.zeros((total_bs, max_audio_samples), dtype=np.float32)
+                        audio_waveform_lens = np.zeros((total_bs,), dtype=np.int32)
+                        audio_sampling_rates = np.full((total_bs,), 16000, dtype=np.int32)
+                        for i, req in enumerate(self.reqs):
+                            if req.audio_waveform is None:
+                                continue
+                            cur_len = int(
+                                req.audio_waveform_len
+                                if req.audio_waveform_len is not None
+                                else req.audio_waveform.shape[0]
+                            )
+                            audio_waveforms[i, :cur_len] = req.audio_waveform[:cur_len]
+                            audio_waveform_lens[i] = cur_len
+                            if req.audio_sampling_rate is not None and int(req.audio_sampling_rate) > 0:
+                                audio_sampling_rates[i] = int(req.audio_sampling_rate)
+
+                if has_audio_features:
+                    max_audio_len = 0
+                    feat_dim = None
+                    for req in self.reqs:
+                        if req.audio_features is not None:
+                            max_audio_len = max(max_audio_len, req.audio_features.shape[1])
+                            if feat_dim is None:
+                                feat_dim = req.audio_features.shape[0]
+                    if max_audio_len > 0 and feat_dim is not None:
+                        audio_features = np.zeros((total_bs, feat_dim, max_audio_len), dtype=np.float32)
+                        audio_attention_mask = np.zeros((total_bs, max_audio_len), dtype=np.int32)
+                        for i, req in enumerate(self.reqs):
+                            if req.audio_features is None:
+                                continue
+                            cur_len = req.audio_features.shape[1]
+                            audio_features[i, :, :cur_len] = req.audio_features
+                            audio_attention_mask[i, :cur_len] = req.audio_attention_mask
+
         return ModelWorkerBatch(
             bid=bid,
             forward_mode=self.forward_mode,
@@ -1670,6 +1790,9 @@ class ScheduleBatch:
             audio_attention_mask=audio_attention_mask,
             audio_token_start=audio_token_start,
             audio_token_len=audio_token_len,
+            audio_waveforms=audio_waveforms,
+            audio_waveform_lens=audio_waveform_lens,
+            audio_sampling_rates=audio_sampling_rates,
         )
 
     def _generate_trace_info(self, real_bs: int, bid: int) -> list[str]:
@@ -1818,6 +1941,9 @@ class ModelWorkerBatch:
     audio_attention_mask: np.ndarray | None = None
     audio_token_start: np.ndarray | None = None
     audio_token_len: np.ndarray | None = None
+    audio_waveforms: np.ndarray | None = None
+    audio_waveform_lens: np.ndarray | None = None
+    audio_sampling_rates: np.ndarray | None = None
 
     capture_hidden_mode: CaptureHiddenMode = None
 

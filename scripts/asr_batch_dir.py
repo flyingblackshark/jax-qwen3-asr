@@ -61,6 +61,7 @@ def _build_payload(model: str, b64_audio: str, max_tokens: int, temperature: flo
             {
                 "role": "user",
                 "content": [
+                    {"type": "text", "text": "<|audio_pad|>"},
                     {
                         "type": "audio_url",
                         "audio_url": {"url": "data:audio/mp3;base64," + b64_audio},
@@ -123,7 +124,7 @@ def main() -> int:
     parser.add_argument("--model", default="Qwen/Qwen3-ASR-1.7B")
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument(
         "--detect-language",

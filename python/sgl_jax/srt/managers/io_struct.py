@@ -146,6 +146,10 @@ class TokenizedGenerateReqInput:
     audio_attention_mask: np.ndarray | None = None
     audio_token_start: int | None = None
     audio_token_len: int | None = None
+    # Raw audio (optional). When present, the model can perform resample + feature extraction on TPU.
+    audio_waveform: np.ndarray | None = None
+    audio_waveform_len: int | None = None
+    audio_sampling_rate: int | None = None
 
 
 @dataclass
